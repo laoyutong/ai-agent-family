@@ -1,0 +1,19 @@
+{
+  "name": "ai-agent-family",
+  "private": true,
+  "scripts": {
+    "build": "lerna run build",
+    "test": "lerna run test",
+    "clean": "lerna clean",
+    "list": "lerna list --all",
+    "create": "lerna create"
+  },
+  "devDependencies": {
+    "lerna": "^9.0.7",
+    "nx": "22.6.0"
+  },
+  "packageManager": "pnpm@9.15.0",
+  "engines": {
+    "node": "^20.19.0 || ^22.12.0 || >=24.0.0"
+  }
+}
