@@ -12,22 +12,6 @@ export function createApiApp(): express.Application {
     return "anonymous";
   }
 
-  /** 从 LangChain 流式 chunk 取出文本增量 */
-  function chunkToText(chunk: unknown): string {
-    if (!chunk || typeof chunk !== "object") return "";
-    if (!("content" in chunk)) return "";
-    const c = (chunk as { content: unknown }).content;
-    if (typeof c === "string") return c;
-    if (Array.isArray(c)) {
-      return c
-        .map((x) =>
-          x && typeof x === "object" && "text" in x ? String((x as { text: string }).text) : "",
-        )
-        .join("");
-    }
-    return "";
-  }
-
   app.post("/api/chat", async (req, res) => {
     const message = typeof req.body?.message === "string" ? req.body.message.trim() : "";
     if (!message) {
@@ -47,9 +31,8 @@ export function createApiApp(): express.Application {
     };
 
     try {
-      const stream = await bot.stream(message, sessionId);
-      for await (const chunk of stream) {
-        const text = chunkToText(chunk);
+      const stream = bot.stream(message, sessionId);
+      for await (const text of stream) {
         if (text) sendSse({ text });
       }
       sendSse({ done: true });

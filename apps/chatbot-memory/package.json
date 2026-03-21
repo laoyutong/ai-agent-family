@@ -2,7 +2,7 @@
   "name": "chatbot-memory",
   "version": "0.0.0",
   "private": true,
-  "description": "带会话记忆的聊天网页（TypeScript + LangChain + DeepSeek）",
+  "description": "带会话记忆的聊天网页（TypeScript + DeepSeek OpenAI 兼容 API）",
   "type": "module",
   "scripts": {
     "dev": "tsx watch src/server/dev.ts",
@@ -11,8 +11,6 @@
     "preview": "vite preview"
   },
   "dependencies": {
-    "@langchain/core": "^0.3.42",
-    "@langchain/openai": "^0.4.4",
     "dompurify": "^3.2.4",
     "dotenv": "^16.4.7",
     "express": "^4.21.2",
