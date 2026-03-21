@@ -1,4 +1,5 @@
 import "./load-env.js";
+import { readUtf8Lines } from "../shared/stream-read.js";
 
 type ChatMessage = { role: "system" | "user" | "assistant"; content: string };
 
@@ -76,42 +77,13 @@ export function createMemoryChatbot(options?: {
       throw new Error(`DeepSeek API ${res.status}: ${errText}`);
     }
 
-    const reader = res.body?.getReader();
-    if (!reader) {
-      throw new Error("响应体为空");
-    }
-
-    const decoder = new TextDecoder();
-    let buffer = "";
     let assistantFull = "";
-    try {
-      while (true) {
-        const { done, value } = await reader.read();
-        if (value) {
-          buffer += decoder.decode(value, { stream: true });
-        }
-        const lines = buffer.split("\n");
-        buffer = lines.pop() ?? "";
-        for (const line of lines) {
-          const text = parseSseDataLine(line);
-          if (text) {
-            assistantFull += text;
-            yield text;
-          }
-        }
-        if (done) {
-          if (buffer.trim()) {
-            const text = parseSseDataLine(buffer);
-            if (text) {
-              assistantFull += text;
-              yield text;
-            }
-          }
-          break;
-        }
+    for await (const line of readUtf8Lines(res.body)) {
+      const text = parseSseDataLine(line);
+      if (text) {
+        assistantFull += text;
+        yield text;
       }
-    } finally {
-      reader.releaseLock();
     }
 
     history.push({ role: "user", content: input });

@@ -1,5 +1,6 @@
 import "./style.css";
 import { renderMarkdown } from "./markdown.js";
+import { readUtf8StreamChunks } from "../shared/stream-read.js";
 
 const app = document.querySelector<HTMLDivElement>("#app");
 if (!app) throw new Error("#app missing");
@@ -250,14 +251,10 @@ async function send(): Promise<void> {
       return;
     }
 
-    const reader = res.body.getReader();
-    const decoder = new TextDecoder();
     let buffer = "";
 
-    readLoop: for (;;) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      buffer += decoder.decode(value, { stream: true });
+    stream: for await (const chunk of readUtf8StreamChunks(res.body)) {
+      buffer += chunk;
       const { events, rest } = parseSseBlocks(buffer);
       buffer = rest;
 
@@ -273,7 +270,7 @@ async function send(): Promise<void> {
           scrollChat();
         }
         if (ev.done === true) {
-          break readLoop;
+          break stream;
         }
       }
     }

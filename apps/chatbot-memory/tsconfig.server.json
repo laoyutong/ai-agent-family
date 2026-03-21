@@ -4,8 +4,8 @@
     "module": "NodeNext",
     "moduleResolution": "NodeNext",
     "lib": ["ES2022"],
-    "outDir": "dist/server",
-    "rootDir": "src/server",
+    "outDir": "dist",
+    "rootDir": "src",
     "strict": true,
     "skipLibCheck": true,
     "sourceMap": true,
@@ -15,6 +15,6 @@
     "noUnusedParameters": true,
     "noFallthroughCasesInSwitch": true
   },
-  "include": ["src/server/**/*.ts"],
+  "include": ["src/server/**/*.ts", "src/shared/**/*.ts"],
   "exclude": ["src/server/dev.ts"]
 }
