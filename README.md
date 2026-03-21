@@ -12,33 +12,36 @@ corepack enable
 pnpm install
 ```
 
+API 密钥（当前为 **DeepSeek**）统一放在仓库根目录：复制 `.env.example` 为 `.env` 并填写 `DEEPSEEK_API_KEY`（`.env` 已列入 `.gitignore`，勿提交）。
+
 ## 常用命令
 
 | 命令 | 说明 |
 |------|------|
-| `pnpm run build` | 在所有包中执行 `build` 脚本 |
-| `pnpm run test` | 在所有包中执行 `test` 脚本 |
-| `pnpm run list` | 列出所有包（含 `private: true`，等价于 `lerna list --all`） |
-| `pnpm run create` | 交互式创建新包（`lerna create`） |
+| `pnpm run build` | 在所有应用中执行 `build` 脚本 |
+| `pnpm run test` | 在所有应用中执行 `test` 脚本 |
+| `pnpm run list` | 列出所有 workspace 项目（含 `private: true`，等价于 `lerna list --all`） |
+| `pnpm run create` | 交互式创建新项目（`lerna create`） |
 | `pnpm add <pkg> -w` | 向**仓库根**添加开发依赖 |
-| `pnpm add <pkg> --filter @ai-agent-family/example` | 向指定 workspace 包添加依赖 |
+| `pnpm add <pkg> --filter chatbot-memory` | 向指定 workspace 应用添加依赖 |
 
-默认的 `lerna list`（不带 `--all`）**不会列出** `package.json` 里 `"private": true` 的包；本地私有包请用 `pnpm run list` 或 `lerna la`。
+默认的 `lerna list`（不带 `--all`）**不会列出** `package.json` 里 `"private": true` 的项目；本地私有应用请用 `pnpm run list` 或 `lerna la`。
 
 ## 布局
 
 - `pnpm-workspace.yaml`：pnpm 的 workspace 声明（与 Lerna 共用同一批 glob）
-- `lerna.json`：`npmClient: pnpm`，并显式配置 `packages`
-- `packages/*`：子包目录；示例为 `packages/example`（可删可改）
+- `lerna.json`：`npmClient: pnpm`，并显式配置 `packages` 字段（指向 `apps/*`）
+- `apps/*`：应用目录（每个子目录为独立 workspace 项目）
+- `apps/chatbot-memory`：带会话记忆的聊天网页（Vite + Express + LangChain，见该目录 `README.md`）
 
 Lerna 9 通过 **Nx** 调度任务（终端里会看到 “Lerna (powered by Nx)”）。根目录的 `nx.json` 由 `nx init` 生成，用于识别 workspace 中的项目。
 
-## 新包
+## 新应用
 
-在 `packages/` 下新建目录并添加 `package.json`，或执行：
+在 `apps/` 下新建目录并添加 `package.json`，或执行：
 
 ```bash
 pnpm run create
 ```
 
-确保包名与 `pnpm-workspace.yaml` 中的 glob 一致（当前为 `packages/*`）。
+确保路径与 `pnpm-workspace.yaml` 中的 glob 一致（当前为 `apps/*`）。
