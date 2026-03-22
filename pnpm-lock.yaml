@@ -17,6 +17,9 @@ importers:
 
   apps/chatbot-memory:
     dependencies:
+      '@dqbd/tiktoken':
+        specifier: ^1.0.21
+        version: 1.0.22
       dompurify:
         specifier: ^3.2.4
         version: 3.3.3
@@ -55,6 +58,9 @@ packages:
   '@babel/helper-validator-identifier@7.28.5':
     resolution: {integrity: sha512-qSs4ifwzKJSV39ucNjsvc6WVHs6b7S03sOh2OcHF9UHfVPqWWALUsNUVzhSBiItjRZoLHx7nIarVjqKVusUZ1Q==}
     engines: {node: '>=6.9.0'}
+
+  '@dqbd/tiktoken@1.0.22':
+    resolution: {integrity: sha512-RYhO8xeHkMNX5Ixqf4M1Ve3siCYJY/dI0yLnlX4M4oIEDOvjMIQ+E+3OUpAaZcWTaMtQJzGcDAghYfllpx3i/w==}
 
   '@emnapi/core@1.9.1':
     resolution: {integrity: sha512-mukuNALVsoix/w1BJwFzwXBN/dHeejQtuVzcDsfOEsdpCumXb/E9j8w11h5S54tT1xhifGfbbSm/ICrObRb3KA==}
@@ -2920,6 +2926,8 @@ snapshots:
       picocolors: 1.1.1
 
   '@babel/helper-validator-identifier@7.28.5': {}
+
+  '@dqbd/tiktoken@1.0.22': {}
 
   '@emnapi/core@1.9.1':
     dependencies:

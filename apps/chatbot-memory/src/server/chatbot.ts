@@ -1,4 +1,5 @@
 import "./load-env.js";
+import { filterDialogueByEntropyPrinciple } from "./entropy-ppl-filter.js";
 import { readUtf8Lines } from "../shared/stream-read.js";
 
 type ChatMessage = { role: "system" | "user" | "assistant"; content: string };
@@ -25,6 +26,15 @@ function parseIntEnv(name: string, defaultValue: number): number {
   if (v === undefined || v === "") return defaultValue;
   const n = Number.parseInt(v, 10);
   return Number.isFinite(n) && n >= 0 ? n : defaultValue;
+}
+
+/** 未设置时用 defaultValue；显式 true/false 类字符串覆盖 */
+function parseEnvBool(name: string, defaultValue: boolean): boolean {
+  const v = process.env[name]?.trim().toLowerCase();
+  if (v === undefined || v === "") return defaultValue;
+  if (v === "0" || v === "false" || v === "no" || v === "off") return false;
+  if (v === "1" || v === "true" || v === "yes" || v === "on") return true;
+  return defaultValue;
 }
 
 function parseSseDataLine(line: string): string | null {
@@ -62,19 +72,16 @@ function parseLayeredFoldOutput(text: string): { summary: string; facts: string 
   return { summary, facts };
 }
 
-export function createMemoryChatbot(options?: {
+/** 仅覆盖 API 与人设；记忆策略、熵过滤等见环境变量 */
+export type MemoryChatbotOptions = {
   model?: string;
   temperature?: number;
   systemPrompt?: string;
   baseURL?: string;
   apiKey?: string;
-  /** 最多保留的对话轮数（user+assistant 算一轮）；0 表示不按轮数裁切 */
-  maxHistoryPairs?: number;
-  /** 历史总字符上限（user+assistant 正文）；0 表示不按字符裁切 */
-  maxHistoryChars?: number;
-  /** 裁切时是否调用模型将去掉的部分折叠进 summary（多一次非流式请求） */
-  summarizeOnTrim?: boolean;
-}) {
+};
+
+export function createMemoryChatbot(options?: MemoryChatbotOptions) {
   const apiKey = options?.apiKey ?? process.env.DEEPSEEK_API_KEY;
   const baseURL = options?.baseURL ?? process.env.DEEPSEEK_BASE_URL ?? "https://api.deepseek.com";
   const model = options?.model ?? process.env.DEEPSEEK_MODEL ?? "deepseek-chat";
@@ -83,13 +90,16 @@ export function createMemoryChatbot(options?: {
     options?.systemPrompt ??
     "你的名字是「知忆」，一位沉稳、专业的中文对话伙伴。根据完整对话历史作答，主动记住用户提到的偏好、事实与约定，并在后续回复中自然运用。语气简洁有礼，避免机械套话。";
 
-  const maxHistoryPairs =
-    options?.maxHistoryPairs ?? parseIntEnv("CHAT_HISTORY_MAX_PAIRS", 30);
-  const maxHistoryChars =
-    options?.maxHistoryChars ?? parseIntEnv("CHAT_HISTORY_MAX_CHARS", 0);
-  const summarizeOnTrim =
-    options?.summarizeOnTrim ??
-    (process.env.CHAT_HISTORY_SUMMARIZE === "1" || process.env.CHAT_HISTORY_SUMMARIZE === "true");
+  const maxHistoryPairs = parseIntEnv("CHAT_HISTORY_MAX_PAIRS", 30);
+  const maxHistoryChars = parseIntEnv("CHAT_HISTORY_MAX_CHARS", 0);
+  /** 裁切丢轮时是否折叠进 summary/facts；默认开启，可用 CHAT_HISTORY_SUMMARIZE=false 关闭 */
+  const summarizeOnTrim = parseEnvBool("CHAT_HISTORY_SUMMARIZE", true);
+  /** 每 N 轮将队首 N 轮与旧摘要融合；默认 5；设为 0 关闭 */
+  const incrementalSummaryEveryNPairs = parseIntEnv("CHAT_INCREMENTAL_SUMMARY_EVERY_N_PAIRS", 5);
+  const entropyPerplexityFilter = parseEnvBool("CHAT_CONTEXT_ENTROPY_PPL_FILTER", true);
+  const entropyFilterMinChars = parseIntEnv("CHAT_CONTEXT_ENTROPY_PPL_MIN_CHARS", 1800);
+  const entropyFilterModel = process.env.CHAT_CONTEXT_ENTROPY_PPL_MODEL?.trim() || model;
+  const entropyFilterMaxTokens = parseIntEnv("CHAT_CONTEXT_ENTROPY_PPL_MAX_TOKENS", 8192);
 
   const chatUrl = joinUrl(baseURL, "/v1/chat/completions");
 
@@ -105,9 +115,21 @@ export function createMemoryChatbot(options?: {
     return blocks.join("\n\n");
   }
 
-  async function completeNonStreaming(messages: ChatMessage[]): Promise<string> {
+  async function completeNonStreaming(
+    messages: ChatMessage[],
+    req?: { model?: string; maxTokens?: number },
+  ): Promise<string> {
     if (!apiKey) {
       throw new Error("未配置 DEEPSEEK_API_KEY");
+    }
+    const body: Record<string, unknown> = {
+      model: req?.model ?? model,
+      temperature: 0.2,
+      messages,
+      stream: false,
+    };
+    if (req?.maxTokens != null && req.maxTokens > 0) {
+      body.max_tokens = req.maxTokens;
     }
     const res = await fetch(chatUrl, {
       method: "POST",
@@ -115,12 +137,7 @@ export function createMemoryChatbot(options?: {
         "Content-Type": "application/json",
         Authorization: `Bearer ${apiKey}`,
       },
-      body: JSON.stringify({
-        model,
-        temperature: 0.2,
-        messages,
-        stream: false,
-      }),
+      body: JSON.stringify(body),
     });
     if (!res.ok) {
       const errText = await res.text();
@@ -196,6 +213,28 @@ export function createMemoryChatbot(options?: {
     }
   }
 
+  /** 从队首取出前 nPairs 轮（2*nPairs 条消息），不足则返回空且不修改 */
+  function takeFirstNPairsFromTurns(turns: ChatMessage[], nPairs: number): ChatMessage[] {
+    const take = nPairs * 2;
+    if (turns.length < take) return [];
+    const dropped = turns.slice(0, take);
+    turns.splice(0, take);
+    return dropped;
+  }
+
+  /**
+   * 增量摘要：总轮数为 N 的整数倍时，将队首 N 轮与既有 summary/facts 融合后移出 turns。
+   * 在长度裁切之前执行，使较早对话先进入摘要层。
+   */
+  function popIncrementalSummaryBatch(session: SessionMemory): ChatMessage[] {
+    const n = incrementalSummaryEveryNPairs;
+    if (n <= 0) return [];
+    const pairCount = session.turns.length / 2;
+    if (!Number.isInteger(pairCount) || pairCount < n) return [];
+    if (pairCount % n !== 0) return [];
+    return takeFirstNPairsFromTurns(session.turns, n);
+  }
+
   /** 仅同步裁切 turns，返回被移出的消息；不调用模型 */
   function trimTurnsIfOverLimit(session: SessionMemory): ChatMessage[] {
     const { turns } = session;
@@ -213,11 +252,16 @@ export function createMemoryChatbot(options?: {
   }
 
   /**
-   * 将裁切出的对话异步折叠进 summary/facts，不阻塞流式响应结束。
-   * 执行时读取当时的 session.summary/facts（链式排队后即为上一任务写入结果），与闭包中的 dropped 合并。
+   * 将移出的对话异步折叠进 summary/facts，不阻塞流式响应结束。
+   * trim：受 CHAT_HISTORY_SUMMARIZE 控制；incremental：每 N 轮定时触发，不受该开关影响。
    */
-  function enqueueFoldDropped(session: SessionMemory, dropped: ChatMessage[]): void {
-    if (dropped.length === 0 || !summarizeOnTrim) return;
+  function enqueueFold(
+    session: SessionMemory,
+    dropped: ChatMessage[],
+    mode: "incremental" | "trim",
+  ): void {
+    if (dropped.length === 0) return;
+    if (mode === "trim" && !summarizeOnTrim) return;
 
     session.foldChain = (session.foldChain ?? Promise.resolve()).then(async () => {
       try {
@@ -229,7 +273,10 @@ export function createMemoryChatbot(options?: {
         session.summary = summary.trim() || undefined;
         session.facts = facts.trim() || undefined;
       } catch (e) {
-        console.error("chat history summarize failed:", e);
+        console.error(
+          mode === "incremental" ? "incremental summary fold failed:" : "chat history summarize failed:",
+          e,
+        );
       }
     });
   }
@@ -245,10 +292,36 @@ export function createMemoryChatbot(options?: {
       sessions.set(sessionId, session);
     }
 
+    const systemContent = buildSystemContent(session);
+    let turnsForApi = session.turns;
+    let userContentForApi = input;
+
+    const historyChars =
+      totalTurnChars(turnsForApi) + userContentForApi.length;
+    const shouldEntropyFilter =
+      entropyPerplexityFilter &&
+      (entropyFilterMinChars === 0 || historyChars >= entropyFilterMinChars);
+
+    if (shouldEntropyFilter) {
+      const asTurns = turnsForApi as Array<{ role: "user" | "assistant"; content: string }>;
+      try {
+        const filtered = await filterDialogueByEntropyPrinciple(
+          asTurns,
+          userContentForApi,
+          completeNonStreaming,
+          { model: entropyFilterModel, maxTokens: entropyFilterMaxTokens },
+        );
+        turnsForApi = filtered.turns;
+        userContentForApi = filtered.currentUser;
+      } catch (e) {
+        console.error("entropy/perplexity context filter failed:", e);
+      }
+    }
+
     const messages: ChatMessage[] = [
-      { role: "system", content: buildSystemContent(session) },
-      ...session.turns,
-      { role: "user", content: input },
+      { role: "system", content: systemContent },
+      ...turnsForApi,
+      { role: "user", content: userContentForApi },
     ];
 
     const res = await fetch(chatUrl, {
@@ -282,8 +355,11 @@ export function createMemoryChatbot(options?: {
     session.turns.push({ role: "user", content: input });
     session.turns.push({ role: "assistant", content: assistantFull });
 
-    const dropped = trimTurnsIfOverLimit(session);
-    enqueueFoldDropped(session, dropped);
+    const droppedIncremental = popIncrementalSummaryBatch(session);
+    enqueueFold(session, droppedIncremental, "incremental");
+
+    const droppedTrim = trimTurnsIfOverLimit(session);
+    enqueueFold(session, droppedTrim, "trim");
   }
 
   return {
