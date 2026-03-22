@@ -302,10 +302,11 @@ async function send(): Promise<void> {
 
 sendBtn.addEventListener("click", () => void send());
 inputEl.addEventListener("keydown", (e) => {
-  if (e.key === "Enter" && !e.shiftKey) {
-    e.preventDefault();
-    void send();
-  }
+  if (e.key !== "Enter" || e.shiftKey) return;
+  // 输入法选字/确认时按回车不应发送（否则会打断组字）
+  if (e.isComposing || e.keyCode === 229) return;
+  e.preventDefault();
+  void send();
 });
 
 clearBtn.addEventListener("click", async () => {
