@@ -24,6 +24,7 @@ const FILTER_SYSTEM = [
   "- 不要编造对话中不存在的事实；不要合并不同轮次里的矛盾表述（应保留冲突双方原意中最短可辨表述）。",
 ].join("\n");
 
+/** 从模型输出中解析出顶层 JSON 对象（支持 ``` 围栏），否则抛错 */
 function parseStrictJsonObject(text: string): Record<string, unknown> {
   const trimmed = text.trim();
   const fenced = trimmed.match(/^```(?:json)?\s*([\s\S]*?)```$/m);
@@ -35,6 +36,7 @@ function parseStrictJsonObject(text: string): Record<string, unknown> {
   return parsed as Record<string, unknown>;
 }
 
+/** 将未知 JSON 数组安全转为 `TurnForFilter[]`，跳过非法元素 */
 function coerceFilteredTurns(raw: unknown): TurnForFilter[] {
   if (!Array.isArray(raw)) return [];
   const out: TurnForFilter[] = [];
@@ -51,7 +53,8 @@ function coerceFilteredTurns(raw: unknown): TurnForFilter[] {
 }
 
 /**
- * 调用方提供的非流式补全（与主对话同基座即可）。
+ * 用一次非流式调用按「困惑度/信息熵」提示词压缩历史与当前用户输入；
+ * 返回过滤后的 `turns` 与 `currentUser`；解析失败则回退为原文。
  */
 export async function filterDialogueByEntropyPrinciple(
   turns: readonly TurnForFilter[],

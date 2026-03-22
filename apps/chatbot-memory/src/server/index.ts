@@ -5,6 +5,7 @@ import { createApiApp } from "./app.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
+/** 启动前校验 `DEEPSEEK_API_KEY`，缺失则打印说明并退出进程 */
 function requireApiKey(): void {
   if (!process.env.DEEPSEEK_API_KEY) {
     console.error(

@@ -1,11 +1,13 @@
 import express from "express";
 import { createMemoryChatbot } from "./chatbot.js";
 
+/** 组装 Express 应用：挂载 JSON、`/api/chat` 流式对话、`/api/clear` 清会话 */
 export function createApiApp(): express.Application {
   const bot = createMemoryChatbot();
   const app = express();
   app.use(express.json({ limit: "1mb" }));
 
+  /** 从请求头读取会话 id，缺省为 `anonymous` */
   function getSessionId(req: express.Request): string {
     const h = req.headers["x-session-id"];
     if (typeof h === "string" && h.trim()) return h.trim();
@@ -26,6 +28,7 @@ export function createApiApp(): express.Application {
     res.setHeader("X-Accel-Buffering", "no");
     res.flushHeaders();
 
+    /** 写入一条 SSE `data:` 行（JSON 序列化） */
     const sendSse = (obj: Record<string, unknown>) => {
       res.write(`data: ${JSON.stringify(obj)}\n\n`);
     };

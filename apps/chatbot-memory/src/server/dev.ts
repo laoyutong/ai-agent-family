@@ -7,6 +7,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 /** apps/chatbot-memory 根目录 */
 const root = path.join(__dirname, "..", "..");
 
+/** 启动前校验 `DEEPSEEK_API_KEY`，缺失则打印说明并退出进程 */
 function requireApiKey(): void {
   if (!process.env.DEEPSEEK_API_KEY) {
     console.error(
@@ -16,6 +17,7 @@ function requireApiKey(): void {
   }
 }
 
+/** 开发模式入口：Vite 中间件 + API 同端口 */
 async function main(): Promise<void> {
   requireApiKey();
 
