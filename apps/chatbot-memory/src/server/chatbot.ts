@@ -10,6 +10,8 @@ type SessionMemory = {
   summary?: string;
   /** 从裁切与历史中沉淀的稳定要点：偏好、事实、约定、专有名词等（长期层，每行一条） */
   facts?: string;
+  /** 后台摘要任务链，保证多轮裁切时按序合并进 summary/facts，避免并发写竞态 */
+  foldChain?: Promise<void>;
 };
 
 const sessions = new Map<string, SessionMemory>();
@@ -147,7 +149,7 @@ export function createMemoryChatbot(options?: {
       {
         role: "system",
         content:
-          "你是对话摘要助手。将「既有摘要」（若有）与「待合并对话」合并为一段简短中文要点，保留事实、偏好、约定与专有名词，省略寒暄与重复。控制在约 800 字以内。",
+          "你是对话摘要助手。将「既有摘要」（若有）与「待合并对话」合并为极简中文要点：只写结论、决定与不可替代的专名/数字，不写过程与寒暄，不逐句复述。合并去重后**总长不超过约 300 字**（宁短勿长）。",
       },
       { role: "user", content: body },
     ]);
@@ -170,8 +172,8 @@ export function createMemoryChatbot(options?: {
         role: "system",
         content:
           "你是记忆分层助手。根据「既有会话摘要」「既有长期要点」（可无）与「待合并对话」，输出**仅**一个 JSON 对象，键为 summary 与 facts，不要 markdown 代码块或其它说明文字。\n" +
-            "summary：叙事脉络（谁在什么话题下讨论了什么、结论如何），中文，约 800 字以内，需与既有摘要合并去重。\n" +
-            "facts：每行一条独立要点，仅稳定信息：用户偏好、事实、约定、专有名词、重要数字；合并既有长期要点并去重，建议不超过 40 行。",
+            "summary：用一两段极短中文概括**仍对后续对话有用**的脉络（话题+结论/立场），不写细节与铺垫；与既有摘要合并去重后**总长不超过约 300 字**。\n" +
+            "facts：每行一条，仅用户偏好、硬事实、约定、专名与关键数字；合并既有长期要点并去重，**不超过 20 行**，能合并成一条的不要拆成多条。",
       },
       { role: "user", content: userContent },
     ]);
@@ -194,7 +196,8 @@ export function createMemoryChatbot(options?: {
     }
   }
 
-  async function compactAfterTurn(session: SessionMemory): Promise<void> {
+  /** 仅同步裁切 turns，返回被移出的消息；不调用模型 */
+  function trimTurnsIfOverLimit(session: SessionMemory): ChatMessage[] {
     const { turns } = session;
     const dropped: ChatMessage[] = [];
 
@@ -206,9 +209,17 @@ export function createMemoryChatbot(options?: {
       dropped.push(turns.shift()!, turns.shift()!);
     }
 
-    if (dropped.length === 0) return;
+    return dropped;
+  }
 
-    if (summarizeOnTrim) {
+  /**
+   * 将裁切出的对话异步折叠进 summary/facts，不阻塞流式响应结束。
+   * 执行时读取当时的 session.summary/facts（链式排队后即为上一任务写入结果），与闭包中的 dropped 合并。
+   */
+  function enqueueFoldDropped(session: SessionMemory, dropped: ChatMessage[]): void {
+    if (dropped.length === 0 || !summarizeOnTrim) return;
+
+    session.foldChain = (session.foldChain ?? Promise.resolve()).then(async () => {
       try {
         const { summary, facts } = await foldDroppedIntoLayers(
           session.summary,
@@ -220,7 +231,7 @@ export function createMemoryChatbot(options?: {
       } catch (e) {
         console.error("chat history summarize failed:", e);
       }
-    }
+    });
   }
 
   async function* streamChat(input: string, sessionId: string): AsyncGenerator<string> {
@@ -271,7 +282,8 @@ export function createMemoryChatbot(options?: {
     session.turns.push({ role: "user", content: input });
     session.turns.push({ role: "assistant", content: assistantFull });
 
-    await compactAfterTurn(session);
+    const dropped = trimTurnsIfOverLimit(session);
+    enqueueFoldDropped(session, dropped);
   }
 
   return {
