@@ -4,10 +4,12 @@ import { readUtf8Lines } from "../shared/stream-read.js";
 type ChatMessage = { role: "system" | "user" | "assistant"; content: string };
 
 type SessionMemory = {
-  /** 交替 user / assistant，不含 system */
+  /** 交替 user / assistant，不含 system —— 短期 verbatim，直接进模型上下文 */
   turns: ChatMessage[];
-  /** 被裁切对话折叠后的要点（可选） */
+  /** 被裁切部分的叙事脉络（中期压缩） */
   summary?: string;
+  /** 从裁切与历史中沉淀的稳定要点：偏好、事实、约定、专有名词等（长期层，每行一条） */
+  facts?: string;
 };
 
 const sessions = new Map<string, SessionMemory>();
@@ -47,6 +49,17 @@ function formatTurnsForSummary(turns: ChatMessage[]): string {
   return turns.map((m) => `${m.role}: ${m.content}`).join("\n");
 }
 
+/** 从模型输出中解析 {"summary":"...","facts":"..."}，失败时抛错 */
+function parseLayeredFoldOutput(text: string): { summary: string; facts: string } {
+  const trimmed = text.trim();
+  const fenced = trimmed.match(/^```(?:json)?\s*([\s\S]*?)```$/m);
+  const jsonStr = (fenced ? fenced[1] : trimmed).trim();
+  const parsed = JSON.parse(jsonStr) as { summary?: unknown; facts?: unknown };
+  const summary = typeof parsed.summary === "string" ? parsed.summary.trim() : "";
+  const facts = typeof parsed.facts === "string" ? parsed.facts.trim() : "";
+  return { summary, facts };
+}
+
 export function createMemoryChatbot(options?: {
   model?: string;
   temperature?: number;
@@ -78,9 +91,16 @@ export function createMemoryChatbot(options?: {
 
   const chatUrl = joinUrl(baseURL, "/v1/chat/completions");
 
-  function buildSystemContent(summary: string | undefined): string {
-    if (!summary?.trim()) return systemPrompt;
-    return `${systemPrompt}\n\n【会话前期摘要】\n${summary.trim()}`;
+  /** 长期要点 → 中期摘要 → 基础人设；近期 verbatim 在 messages 的 turns 里 */
+  function buildSystemContent(session: Pick<SessionMemory, "summary" | "facts">): string {
+    const blocks: string[] = [systemPrompt];
+    if (session.facts?.trim()) {
+      blocks.push(`【长期要点】（事实、偏好、约定与专有名词；每行一条）\n${session.facts.trim()}`);
+    }
+    if (session.summary?.trim()) {
+      blocks.push(`【会话前期摘要】（已结束话题的叙事脉络）\n${session.summary.trim()}`);
+    }
+    return blocks.join("\n\n");
   }
 
   async function completeNonStreaming(messages: ChatMessage[]): Promise<string> {
@@ -114,6 +134,7 @@ export function createMemoryChatbot(options?: {
     return text.trim();
   }
 
+  /** 单段摘要（仅在分层 JSON 解析失败时作降级） */
   async function foldDroppedIntoSummary(
     previousSummary: string | undefined,
     dropped: ChatMessage[],
@@ -132,6 +153,47 @@ export function createMemoryChatbot(options?: {
     ]);
   }
 
+  /** 记忆分层：一次调用同时更新叙事摘要与长期要点 */
+  async function foldDroppedIntoLayers(
+    previousSummary: string | undefined,
+    previousFacts: string | undefined,
+    dropped: ChatMessage[],
+  ): Promise<{ summary: string; facts: string }> {
+    const userParts: string[] = [];
+    if (previousSummary?.trim()) userParts.push(`既有会话摘要：\n${previousSummary.trim()}`);
+    if (previousFacts?.trim()) userParts.push(`既有长期要点：\n${previousFacts.trim()}`);
+    userParts.push(`待合并对话：\n${formatTurnsForSummary(dropped)}`);
+    const userContent = userParts.join("\n\n");
+
+    const raw = await completeNonStreaming([
+      {
+        role: "system",
+        content:
+          "你是记忆分层助手。根据「既有会话摘要」「既有长期要点」（可无）与「待合并对话」，输出**仅**一个 JSON 对象，键为 summary 与 facts，不要 markdown 代码块或其它说明文字。\n" +
+            "summary：叙事脉络（谁在什么话题下讨论了什么、结论如何），中文，约 800 字以内，需与既有摘要合并去重。\n" +
+            "facts：每行一条独立要点，仅稳定信息：用户偏好、事实、约定、专有名词、重要数字；合并既有长期要点并去重，建议不超过 40 行。",
+      },
+      { role: "user", content: userContent },
+    ]);
+
+    try {
+      const { summary, facts } = parseLayeredFoldOutput(raw);
+      if (!summary && !facts) {
+        throw new Error("layered fold empty");
+      }
+      return {
+        summary: summary || (previousSummary?.trim() ?? ""),
+        facts: facts || (previousFacts?.trim() ?? ""),
+      };
+    } catch {
+      const summaryOnly = await foldDroppedIntoSummary(previousSummary, dropped);
+      return {
+        summary: summaryOnly,
+        facts: previousFacts?.trim() ?? "",
+      };
+    }
+  }
+
   async function compactAfterTurn(session: SessionMemory): Promise<void> {
     const { turns } = session;
     const dropped: ChatMessage[] = [];
@@ -148,7 +210,13 @@ export function createMemoryChatbot(options?: {
 
     if (summarizeOnTrim) {
       try {
-        session.summary = await foldDroppedIntoSummary(session.summary, dropped);
+        const { summary, facts } = await foldDroppedIntoLayers(
+          session.summary,
+          session.facts,
+          dropped,
+        );
+        session.summary = summary.trim() || undefined;
+        session.facts = facts.trim() || undefined;
       } catch (e) {
         console.error("chat history summarize failed:", e);
       }
@@ -167,7 +235,7 @@ export function createMemoryChatbot(options?: {
     }
 
     const messages: ChatMessage[] = [
-      { role: "system", content: buildSystemContent(session.summary) },
+      { role: "system", content: buildSystemContent(session) },
       ...session.turns,
       { role: "user", content: input },
     ];
