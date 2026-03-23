@@ -14,9 +14,13 @@ type ChatMessageForTools =
   | { role: "assistant"; content: string | null; tool_calls?: OpenAiToolCall[] }
   | { role: "tool"; tool_call_id: string; content: string };
 
+/**
+ * 单轮用户消息内，「模型请求工具 → 执行 → 把结果写回再请求」的最大轮数。
+ * 不是遍历 MCP 上的全部工具；每轮仅执行当次响应里出现的 tool_calls。
+ */
 const MAX_TOOL_ROUNDS = 16;
 
-/** DeepSeek / OpenAI 兼容接口：function.name 长度上限 */
+/** DeepSeek 要求 tools[].function.name 不超过此长度（与 OpenAI 兼容接口一致） */
 const MAX_OPENAI_FUNCTION_NAME_LEN = 64;
 
 function sanitizeToolNamePart(s: string): string {
@@ -24,9 +28,7 @@ function sanitizeToolNamePart(s: string): string {
   return t || "x";
 }
 
-/**
- * 为每个 MCP 工具生成唯一、可读、≤64 的函数名，便于模型根据名称与 description 自主选择工具。
- */
+/** 生成 OpenAI tools 用的 function.name：唯一、可读、≤MAX_OPENAI_FUNCTION_NAME_LEN，便于模型区分 */
 function makeOpenAiToolNames(list: Array<{ serverId: string; name: string }>): string[] {
   const used = new Set<string>();
   const out: string[] = [];
@@ -53,7 +55,7 @@ function makeOpenAiToolNames(list: Array<{ serverId: string; name: string }>): s
   return out;
 }
 
-/** 去掉 JSON Schema 里的 description，常能显著缩小体积；仍过大则退回宽松 object */
+/** 递归去掉 JSON Schema 中的 description，以减小体积（与 slimParametersForApi 搭配） */
 function stripSchemaDescriptions(x: unknown): unknown {
   if (x === null || typeof x !== "object") return x;
   if (Array.isArray(x)) return x.map(stripSchemaDescriptions);
@@ -88,7 +90,7 @@ export type ChatMcpPayloadLimits = {
   maxDescriptionChars: number;
   maxToolResultChars: number;
   maxToolsJsonBytes: number;
-  /** 整段 messages JSON 上限，避免对话过长触发 413 */
+  /** 整段 messages 序列化后的字节上限，防止上下文过大触发 413 */
   maxContextJsonBytes: number;
 };
 
@@ -103,7 +105,7 @@ function loadChatMcpPayloadLimits(): ChatMcpPayloadLimits {
   };
 }
 
-/** 从前往后删成对的 user/assistant，缩小整段对话 JSON，保留 system 与末尾当前 user */
+/** 缩小 messages：优先删掉最早的一对 user/assistant，保留 system 与最后一条 user */
 function trimMessagesForByteBudget(messages: ChatMessageForTools[], maxBytes: number): ChatMessageForTools[] {
   const m = messages.map((row) => ({ ...row }));
   const size = () => Buffer.byteLength(JSON.stringify(m), "utf8");
@@ -123,7 +125,7 @@ function trimMessagesForByteBudget(messages: ChatMessageForTools[], maxBytes: nu
   return m;
 }
 
-/** 多轮 tool 后体积暴涨：先缩短最旧的 tool 正文，仍超限再删早期对话（就地修改） */
+/** 工具轮次多了以后 messages 膨胀：先替换最旧的 tool 消息正文为占位，仍超限再走 trimMessagesForByteBudget（就地修改） */
 function squeezeMessagesForByteBudget(messages: ChatMessageForTools[], maxBytes: number): void {
   const bytes = () => Buffer.byteLength(JSON.stringify(messages), "utf8");
   let guard = 0;
@@ -142,7 +144,8 @@ function squeezeMessagesForByteBudget(messages: ChatMessageForTools[], maxBytes:
 }
 
 /**
- * 将 MCP 工具转为 OpenAI tools；`function.name` 为可读唯一名（≤64），`nameToRef` 用于解析模型返回的 tool_calls。
+ * 把 listTools() 结果转成请求体里的 tools[]，并建 Map：OpenAI function.name → 真实 MCP (serverId, toolName)。
+ * 若 tools 总 JSON 过大，会裁减列表或压扁 parameters（见 CHAT_MCP_*）。
  */
 function mcpListToOpenAiToolsAndMap(
   list: Awaited<ReturnType<McpPool["listTools"]>>,
@@ -237,7 +240,7 @@ async function chatCompletionNonStream(options: {
       temperature,
       messages,
       tools,
-      /** 由模型根据用户意图与工具说明自主选择是否调用、调用哪一个（及参数） */
+      // tool_choice=auto：是否调用工具、调用哪一个、参数为何，均由模型决定；非遍历执行全部 tools
       tool_choice: "auto",
       stream: false,
     }),
@@ -255,8 +258,10 @@ async function chatCompletionNonStream(options: {
 }
 
 /**
- * 在已组好的 messages（含 system + 历史 + 当前 user）上跑 MCP 工具循环，最后流式输出助手正文。
- * 返回完整助手文本（供写入会话记忆）。
+ * 使用 DeepSeek Function Calling 驱动 MCP：反复请求直到模型不再返回 tool_calls，再产出最终回复。
+ *
+ * - listTools 仅用于把「工具定义」塞进 tools，不会逐个执行。
+ * - 每轮仅对响应中的 tool_calls 调用 mcp.callTool；无 tool_calls 时 yield 正文并结束。
  */
 export async function* streamChatWithMcpTools(options: {
   mcp: McpPool;
@@ -264,7 +269,7 @@ export async function* streamChatWithMcpTools(options: {
   apiKey: string;
   model: string;
   temperature: number;
-  /** 已含 system、历史 turns、本轮 user */
+  /** 已含 system、历史 user/assistant、本轮 user（工具轮次中会就地追加 assistant/tool） */
   messages: ChatMessageForTools[];
 }): AsyncGenerator<string, string> {
   const { mcp, chatBaseUrl, apiKey, model, temperature } = options;
@@ -286,6 +291,7 @@ export async function* streamChatWithMcpTools(options: {
   }
 
   for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
+    // 每一轮：一次 chat/completions；若有 tool_calls 则执行后 continue，否则 yield 正文并 return
     squeezeMessagesForByteBudget(messages, limits.maxContextJsonBytes);
     const { message } = await chatCompletionNonStream({
       chatUrl,
@@ -340,5 +346,5 @@ export async function* streamChatWithMcpTools(options: {
     return text;
   }
 
-  throw new Error(`工具调用超过 ${MAX_TOOL_ROUNDS} 轮上限`);
+  throw new Error(`模型与工具多轮往返超过 ${MAX_TOOL_ROUNDS} 轮上限（非 MCP 工具总数）`);
 }

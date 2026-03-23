@@ -20,7 +20,7 @@ export type MemoryChatbotOptions = {
   systemPrompt?: string;
   baseURL?: string;
   apiKey?: string;
-  /** 若已配置且能列出工具，主对话会走工具循环（如 MCP filesystem 读目录/文件） */
+  /** 传入则在本轮可走 Function Calling + MCP：listTools 只注册定义，仅模型请求的 tool 会 callTool */
   mcp?: McpPool;
 };
 
@@ -49,7 +49,9 @@ export function createMemoryChatbot(options?: MemoryChatbotOptions) {
   const enqueueFold = createEnqueueFold(foldDroppedIntoLayers, behavior.summarizeOnTrim);
 
   /**
-   * 单轮对话主流程：取/建会话 → 组消息（可选熵过滤）→ 流式请求 → 持久化本轮 → 触发摘要队列。
+   * 单轮用户消息：取/建会话 → 组 messages（可选熵过滤）
+   * → 若 MCP 有工具则走 streamChatWithMcpTools（多轮 tool 直至模型出正文），否则 DeepSeek 流式
+   * → 写入 turns → 摘要/裁切队列。
    */
   async function* streamChat(input: string, sessionId: string): AsyncGenerator<string> {
     if (!apiKey) {
