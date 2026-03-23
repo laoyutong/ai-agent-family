@@ -21,7 +21,7 @@ function requireApiKey(): void {
 async function main(): Promise<void> {
   requireApiKey();
 
-  const app = createApiApp();
+  const { app, shutdown } = await createApiApp();
   const vite = await createViteServer({
     root,
     configFile: path.join(root, "vite.config.ts"),
@@ -32,9 +32,19 @@ async function main(): Promise<void> {
   app.use(vite.middlewares);
 
   const PORT = Number(process.env.PORT) || 5173;
-  app.listen(PORT, () => {
+  const server = app.listen(PORT, () => {
     console.log(`开发服务器（前端 + API）http://127.0.0.1:${PORT}`);
   });
+
+  const stop = async () => {
+    try {
+      await shutdown();
+    } finally {
+      server.close(() => process.exit(0));
+    }
+  };
+  process.on("SIGINT", stop);
+  process.on("SIGTERM", stop);
 }
 
 main().catch((err) => {

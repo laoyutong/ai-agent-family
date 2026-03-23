@@ -15,17 +15,34 @@ function requireApiKey(): void {
   }
 }
 
-requireApiKey();
+async function main(): Promise<void> {
+  requireApiKey();
 
-const app = createApiApp();
-const clientDir = path.join(__dirname, "..", "client");
+  const { app, shutdown } = await createApiApp();
+  const clientDir = path.join(__dirname, "..", "client");
 
-app.use(express.static(clientDir));
-app.get("*", (_req, res) => {
-  res.sendFile(path.join(clientDir, "index.html"));
-});
+  app.use(express.static(clientDir));
+  app.get("*", (_req, res) => {
+    res.sendFile(path.join(clientDir, "index.html"));
+  });
 
-const PORT = Number(process.env.PORT) || 3001;
-app.listen(PORT, () => {
-  console.log(`聊天服务已启动 http://127.0.0.1:${PORT}`);
+  const PORT = Number(process.env.PORT) || 3001;
+  const server = app.listen(PORT, () => {
+    console.log(`聊天服务已启动 http://127.0.0.1:${PORT}`);
+  });
+
+  const stop = async () => {
+    try {
+      await shutdown();
+    } finally {
+      server.close(() => process.exit(0));
+    }
+  };
+  process.on("SIGINT", stop);
+  process.on("SIGTERM", stop);
+}
+
+main().catch((err) => {
+  console.error(err);
+  process.exit(1);
 });

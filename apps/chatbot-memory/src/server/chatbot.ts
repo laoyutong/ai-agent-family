@@ -6,7 +6,9 @@ import { parseSseDataLine } from "./deepseek-sse.js";
 import { filterDialogueByEntropyPrinciple } from "./entropy-ppl-filter.js";
 import { createEnqueueFold, createMemoryFold } from "./memory-fold.js";
 import { popIncrementalSummaryBatch, totalTurnChars, trimTurnsIfOverLimit } from "./memory-turns.js";
+import { streamChatWithMcpTools } from "./chat-mcp-tools.js";
 import { buildSystemContent } from "./system-content.js";
+import type { McpPool } from "./mcp.js";
 import { readUtf8Lines } from "../shared/stream-read.js";
 
 const sessions = new Map<string, SessionMemory>();
@@ -18,6 +20,8 @@ export type MemoryChatbotOptions = {
   systemPrompt?: string;
   baseURL?: string;
   apiKey?: string;
+  /** 若已配置且能列出工具，主对话会走工具循环（如 MCP filesystem 读目录/文件） */
+  mcp?: McpPool;
 };
 
 /**
@@ -25,6 +29,7 @@ export type MemoryChatbotOptions = {
  * 记忆策略由环境变量控制（见 `loadMemoryChatbotBehaviorConfig`）。
  */
 export function createMemoryChatbot(options?: MemoryChatbotOptions) {
+  const mcpPool = options?.mcp;
   const apiKey = options?.apiKey ?? process.env.DEEPSEEK_API_KEY;
   const baseURL = options?.baseURL ?? process.env.DEEPSEEK_BASE_URL ?? "https://api.deepseek.com";
   const model = options?.model ?? process.env.DEEPSEEK_MODEL ?? "deepseek-chat";
@@ -87,6 +92,37 @@ export function createMemoryChatbot(options?: MemoryChatbotOptions) {
       ...turnsForApi,
       { role: "user" as const, content: userContentForApi },
     ];
+
+    if (mcpPool?.configured) {
+      try {
+        const listed = await mcpPool.listTools();
+        if (listed.length > 0) {
+          let assistantFull = "";
+          for await (const chunk of streamChatWithMcpTools({
+            mcp: mcpPool,
+            chatBaseUrl: baseURL,
+            apiKey: apiKey!,
+            model,
+            temperature,
+            messages,
+          })) {
+            assistantFull += chunk;
+            yield chunk;
+          }
+          session.turns.push({ role: "user", content: input });
+          session.turns.push({ role: "assistant", content: assistantFull });
+
+          const droppedIncremental = popIncrementalSummaryBatch(session, behavior.incrementalSummaryEveryNPairs);
+          enqueueFold(session, droppedIncremental, "incremental");
+
+          const droppedTrim = trimTurnsIfOverLimit(session, behavior);
+          enqueueFold(session, droppedTrim, "trim");
+          return;
+        }
+      } catch (e) {
+        console.error("MCP 工具对话失败，回退为普通流式:", e);
+      }
+    }
 
     const res = await fetch(chatUrl, {
       method: "POST",
