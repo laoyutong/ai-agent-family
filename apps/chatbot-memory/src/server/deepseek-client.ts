@@ -1,5 +1,45 @@
 import type { ChatMessage } from "./chat-types.js";
 
+/** OpenAI 兼容 chat/completions 的 message 行（非流式） */
+export type ChatCompletionMessageRow = { role: string; content?: string | null };
+
+/**
+ * 非流式 chat/completions：返回 choices[0].message（含 content，可为 null）。
+ * 与 `createCompleteNonStreaming` 区分：支持自定义 temperature、任意 role 组合。
+ */
+export async function fetchChatCompletionNonStream(options: {
+  chatUrl: string;
+  apiKey: string;
+  model: string;
+  temperature: number;
+  messages: ChatCompletionMessageRow[];
+}): Promise<{ content?: string | null }> {
+  const { chatUrl, apiKey, model, temperature, messages } = options;
+  const res = await fetch(chatUrl, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${apiKey}`,
+    },
+    body: JSON.stringify({
+      model,
+      temperature,
+      messages,
+      stream: false,
+    }),
+  });
+  if (!res.ok) {
+    const errText = await res.text();
+    throw new Error(`DeepSeek API ${res.status}: ${errText}`);
+  }
+  const json = (await res.json()) as {
+    choices?: { message?: { content?: string | null } }[];
+  };
+  const message = json.choices?.[0]?.message;
+  if (!message) throw new Error("模型返回无 message");
+  return { content: message.content };
+}
+
 /** 拼接 API 根地址与路径，避免重复或缺失斜杠 */
 export function joinUrl(base: string, path: string): string {
   return `${base.replace(/\/$/, "")}/${path.replace(/^\//, "")}`;

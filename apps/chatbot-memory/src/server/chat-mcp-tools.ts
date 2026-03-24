@@ -1,10 +1,12 @@
-import { joinUrl } from "./deepseek-client.js";
+import { squeezeMessagesForByteBudget, trimMessagesForByteBudget } from "./chat-message-budget.js";
 import { parseEnvBool } from "./chat-env.js";
 import { loadChatMcpPayloadLimits, loadMcpCodeSandboxLimits, type ChatMcpPayloadLimits } from "./chat-mcp-limits.js";
+import { fetchChatCompletionNonStream, joinUrl } from "./deepseek-client.js";
 import { parseSseDataLine } from "./deepseek-sse.js";
-import { runMcpSandboxCode } from "./mcp-code-sandbox.js";
+import { logMcpSandboxCode, runMcpSandboxCode } from "./mcp-code-sandbox.js";
 import { buildMcpFacadeFromTools, extractFirstFencedCodeBlock } from "./mcp-facade-prompt.js";
 import type { McpPool } from "./mcp.js";
+import { clipText } from "../shared/text.js";
 import { readUtf8Lines } from "../shared/stream-read.js";
 
 export type { ChatMcpPayloadLimits };
@@ -18,56 +20,6 @@ type ChatMessageForMcp =
  * 单轮用户消息内，「生成代码 → 沙盒执行 → 模型最终答复」的最大尝试次数（含重试生成代码）。
  */
 const MAX_MCP_CODE_ROUNDS = 16;
-
-function clipText(s: string, maxChars: number): string {
-  if (s.length <= maxChars) return s;
-  return `${s.slice(0, Math.max(0, maxChars - 1))}…`;
-}
-
-/** 服务端日志：便于排查沙盒实际执行的代码（grep `[MCP] sandbox:code`） */
-function logMcpSandboxCode(round: number, code: string): void {
-  const max = 24_000;
-  const body = code.length > max ? `${code.slice(0, max)}…` : code;
-  console.log(`[MCP] sandbox:code`, { round, chars: code.length, body });
-}
-
-/** 缩小 messages：优先删掉最早的一对 user/assistant，保留 system 与最后一条 user */
-function trimMessagesForByteBudget(messages: ChatMessageForMcp[], maxBytes: number): ChatMessageForMcp[] {
-  const m = messages.map((row) => ({ ...row }));
-  const size = () => Buffer.byteLength(JSON.stringify(m), "utf8");
-  while (size() > maxBytes && m.length > 2) {
-    if (m[0]?.role === "system" && m[1]?.role === "user" && m[2]?.role === "assistant") {
-      m.splice(1, 2);
-      continue;
-    }
-    m.splice(1, 1);
-  }
-  if (size() > maxBytes && m.length >= 2 && m[0]?.role === "system") {
-    const u = m[1];
-    if (u?.role === "user" && typeof u.content === "string" && u.content.length > 8000) {
-      u.content = `${u.content.slice(0, 8000)}…\n[已截断：当前用户消息过长]`;
-    }
-  }
-  return m;
-}
-
-/** messages 膨胀时：将较早的 assistant 正文替换为占位，仍超限则 trim */
-function squeezeMessagesForByteBudget(messages: ChatMessageForMcp[], maxBytes: number): void {
-  const bytes = () => Buffer.byteLength(JSON.stringify(messages), "utf8");
-  let guard = 0;
-  while (bytes() > maxBytes && guard++ < 2000) {
-    const idx = messages.findIndex((x, i) => i > 0 && x.role === "assistant");
-    if (idx === -1) break;
-    const row = messages[idx] as { role: "assistant"; content: string | null };
-    const prevLen = (row.content ?? "").length;
-    row.content = `[已省略早前助手输出（原约 ${prevLen} 字符）]`;
-  }
-  if (bytes() > maxBytes) {
-    const t = trimMessagesForByteBudget(messages, maxBytes);
-    messages.length = 0;
-    messages.push(...t);
-  }
-}
 
 function formatExecutionResultForLlm(
   sandbox: Awaited<ReturnType<typeof runMcpSandboxCode>>,
@@ -96,39 +48,6 @@ function formatExecutionResultForLlm(
     parts.push(`(MCP 调用次数: ${sandbox.callCount})`);
   }
   return clipText(parts.join("\n"), maxChars);
-}
-
-async function chatCompletionNonStream(options: {
-  chatUrl: string;
-  apiKey: string;
-  model: string;
-  temperature: number;
-  messages: ChatMessageForMcp[];
-}): Promise<{ content?: string | null }> {
-  const { chatUrl, apiKey, model, temperature, messages } = options;
-  const res = await fetch(chatUrl, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${apiKey}`,
-    },
-    body: JSON.stringify({
-      model,
-      temperature,
-      messages,
-      stream: false,
-    }),
-  });
-  if (!res.ok) {
-    const errText = await res.text();
-    throw new Error(`DeepSeek API ${res.status}: ${errText}`);
-  }
-  const json = (await res.json()) as {
-    choices?: { message?: { content?: string | null } }[];
-  };
-  const message = json.choices?.[0]?.message;
-  if (!message) throw new Error("模型返回无 message");
-  return { content: message.content };
 }
 
 const MCP_CODE_SYSTEM_HINT = `
@@ -212,7 +131,7 @@ export async function* streamChatWithMcpTools(options: {
   let round = 0;
   for (; round < MAX_MCP_CODE_ROUNDS; round++) {
     squeezeMessagesForByteBudget(messages, limits.maxContextJsonBytes);
-    const { content } = await chatCompletionNonStream({
+    const { content } = await fetchChatCompletionNonStream({
       chatUrl,
       apiKey,
       model,

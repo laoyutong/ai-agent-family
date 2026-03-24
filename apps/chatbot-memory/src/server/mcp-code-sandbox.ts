@@ -1,6 +1,13 @@
 import vm from "node:vm";
 import type { McpPool } from "./mcp.js";
 
+/** 服务端日志：便于排查沙盒实际执行的代码（grep `[MCP] sandbox:code`） */
+export function logMcpSandboxCode(round: number, code: string): void {
+  const max = 24_000;
+  const body = code.length > max ? `${code.slice(0, max)}…` : code;
+  console.log(`[MCP] sandbox:code`, { round, chars: code.length, body });
+}
+
 function cloneJsonSafe(x: unknown): unknown {
   try {
     return JSON.parse(JSON.stringify(x));

@@ -1,16 +1,17 @@
 import type { ChatMcpPayloadLimits } from "./chat-mcp-limits.js";
 import type { McpPool } from "./mcp.js";
+import { clipText } from "../shared/text.js";
 
 /** 与 OpenAI function.name 一致：唯一、可读、≤64，便于与历史逻辑对齐 */
 const MAX_OPENAI_FUNCTION_NAME_LEN = 64;
 
-export function sanitizeToolNamePart(s: string): string {
+function sanitizeToolNamePart(s: string): string {
   const t = s.replace(/[^a-zA-Z0-9_-]/g, "_").replace(/_+/g, "_");
   return t || "x";
 }
 
 /** 生成唯一工具键（亦作 `mcp` 上的属性名基础） */
-export function makeOpenAiToolNames(list: Array<{ serverId: string; name: string }>): string[] {
+function makeOpenAiToolNames(list: Array<{ serverId: string; name: string }>): string[] {
   const used = new Set<string>();
   const out: string[] = [];
   for (const item of list) {
@@ -41,13 +42,8 @@ function isValidJsIdentifier(s: string): boolean {
 }
 
 /** 对象字面量中的属性名：合法标识符则裸写，否则 JSON 引号 */
-export function escapePropertyName(s: string): string {
+function escapePropertyName(s: string): string {
   return isValidJsIdentifier(s) ? s : JSON.stringify(s);
-}
-
-function clipText(s: string, maxChars: number): string {
-  if (s.length <= maxChars) return s;
-  return `${s.slice(0, Math.max(0, maxChars - 1))}…`;
 }
 
 /** 递归去掉 JSON Schema 中的 description，减小体积 */
@@ -77,7 +73,7 @@ function slimSchemaForTs(schema: unknown, maxBytes: number): unknown {
 /**
  * 将 JSON Schema 转为简化的 TypeScript 式类型占位（仅常见子集；过大则退化为 Record<string, unknown>）。
  */
-export function jsonSchemaToTsLike(schema: unknown, maxBytes = 2048): string {
+function jsonSchemaToTsLike(schema: unknown, maxBytes = 2048): string {
   const slim = slimSchemaForTs(schema, maxBytes);
   const walk = (x: unknown, depth: number): string => {
     if (depth > 8) return "unknown";
@@ -120,7 +116,7 @@ export function jsonSchemaToTsLike(schema: unknown, maxBytes = 2048): string {
   }
 }
 
-export type McpFacadeBuild = {
+type McpFacadeBuild = {
   facadeText: string;
   nameToRef: Map<string, { serverId: string; toolName: string }>;
 };

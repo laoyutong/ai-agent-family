@@ -2,21 +2,12 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import express from "express";
 import { createApiApp } from "./app.js";
+import { requireDeepseekApiKey } from "./require-api-key.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
-/** 启动前校验 `DEEPSEEK_API_KEY`，缺失则打印说明并退出进程 */
-function requireApiKey(): void {
-  if (!process.env.DEEPSEEK_API_KEY) {
-    console.error(
-      "缺少 DEEPSEEK_API_KEY：请在仓库根目录配置 .env（参考 .env.example）",
-    );
-    process.exit(1);
-  }
-}
-
 async function main(): Promise<void> {
-  requireApiKey();
+  requireDeepseekApiKey();
 
   const { app, shutdown } = await createApiApp();
   const clientDir = path.join(__dirname, "..", "client");
