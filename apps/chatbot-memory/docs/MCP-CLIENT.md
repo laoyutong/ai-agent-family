@@ -22,16 +22,17 @@
 └────────┬─────────┘
          │ createMemoryChatbot({ mcp })
          ▼
-┌──────────────────┐     tools + messages   ┌──────────────────┐
+┌──────────────────┐   messages（无 tools）  ┌──────────────────┐
 │  chatbot.ts      │ ────────────────────► │ DeepSeek API      │
-│  streamChat      │     chat-mcp-tools.ts  │ /v1/chat/...     │
-└──────────────────┘                        └──────────────────┘
+│  streamChat      │   mcp-facade-prompt   │ /v1/chat/...     │
+│                  │   mcp-code-sandbox    │                  │
+└──────────────────┘   chat-mcp-tools.ts   └──────────────────┘
 ```
 
 - **MCP Client**：Node 进程内的 `Client` 实例（每个已连接的服务器一个），负责协议层的 `listTools`、`callTool`。
 - **McpPool**：对多个 `Client` 的薄封装，用配置里的 `id` 区分「连到哪台 MCP」，供聊天与 HTTP 共用。
-- **大模型**：不直接连 MCP；通过 **Function Calling**（`tools` + `tool_choice: "auto"`）决定**是否**调工具、**调哪一个**；`listTools()` 只是把工具**定义**发给模型，**不会**自动执行每一个工具。
-- **执行**：仅当某次模型响应里出现 `tool_calls` 时，本应用才 `McpPool.callTool`。
+- **大模型**：不直接连 MCP；通过 **在 system 中注入 `mcp` 门面说明**，让模型输出 **fenced 代码块**；服务端在 **`node:vm` 沙盒** 中执行代码，将 `mcp.xxx` / `__call_mcp__` 转发为 **`McpPool.callTool`**。
+- **执行**：模型生成的代码在沙盒内运行；每次「工具调用」由拦截层映射到真实 MCP，**不再**使用 DeepSeek 的 `tools` / `tool_calls`。
 
 ---
 
@@ -103,20 +104,21 @@
 3. 若 MCP 路径抛错，会打日志并 **回退** 到无工具的流式对话。
 4. 若未配置 MCP 或工具列表为空，行为与原来一致：仅 DeepSeek 流式补全。
 
-会话记忆里仍只存 **user / assistant 文本**；工具调用与 `role: tool` 消息只在**当轮**与模型的多轮往返中存在，**不**逐条写入 `turns`。
+会话记忆里仍只存 **user / assistant 文本**；代码执行与「【代码执行结果】」等中间消息只在**当轮**与模型的多轮往返中存在，**不**逐条写入 `turns`。
 
 ### 4.2 `streamChatWithMcpTools` 在做什么
 
-1. **体积控制**：按环境变量限制工具数量、单工具 schema、工具返回长度、整段 `messages` JSON 等，避免 413（见 `loadChatMcpPayloadLimits`）；必要时**裁减**发往模型的工具列表子集。
-2. **工具映射到 OpenAI 形态**：把 `listTools()` 得到的能力描述转为请求里的 `tools[]`；`function.name` 可读、唯一且 **≤64 字符**；维护 Map：`name → (serverId, MCP toolName)`，用于解析模型返回的 `tool_calls`。
-3. **System 提示**：在首条 system 上追加简短【工具】说明（若尚未包含）。
-4. **多轮「模型 ↔ 工具结果」**（最多 `MAX_TOOL_ROUNDS`，**不是**对 MCP 上每个 tool 跑一遍）：
-   - 调用 DeepSeek **`/v1/chat/completions`**，**非流式**，携带 `tools` 与 **`tool_choice: "auto"`**。
-   - 若响应含 **`tool_calls`**：只对其中列出的函数执行 `mcp.callTool(...)`，将结果以 `role: "tool"` 追加到 `messages`，**再发下一轮**请求。
-   - 若**无** `tool_calls` 且有最终 **`content`**：将助手正文分块 **yield**（经 SSE 到前端）。
-5. **执行工具**：一律经 **`McpPool.callTool`**（SDK `Client.callTool`）。
+1. **体积控制**：按环境变量限制工具数量、单工具 schema、工具返回长度、整段 `messages` JSON 等，避免 413（见 `loadChatMcpPayloadLimits`，定义于 `chat-mcp-limits.ts`）；必要时**裁减** `listTools()` 子集并缩小生成的 `mcp` 门面文本。
+2. **门面生成**（`mcp-facade-prompt.ts`）：把 `listTools()` 的 `inputSchema` 转成简化的 TypeScript 式参数类型，生成 `declare function __call_mcp__(…)` 与 `export const mcp = { … }` 说明文本；维护 Map：**工具键 → (serverId, MCP toolName)**，与沙盒内注入的 `mcp` 方法一致。
+3. **System 提示**：在首条 system 上追加【MCP 代码执行】说明与门面全文（若尚未包含【MCP 代码执行】标记）。
+4. **代码生成轮**（非流式 `chat/completions`，**不传** `tools`）：
+   - 模型输出须含 **一个** `javascript` / `typescript` fenced 代码块；解析后交给 `mcp-code-sandbox.ts`。
+   - 若未找到代码块或沙盒执行未成功（且未超过轮次上限），在同一会话中追加 **assistant + user（执行结果 + 重试说明）**，再请求模型**仅**输出修正后的代码块。
+   - 若沙盒执行成功（`ok: true`），进入最终答复轮。
+5. **沙盒执行**（`mcp-code-sandbox.ts`）：`node:vm` 受限上下文，仅暴露 `mcp`、`__call_mcp__`、受限 `console` 与安全内置对象；`Promise.race` 控制**总执行时长**（`CHAT_MCP_CODE_MAX_MS`）；单次执行内 MCP 调用次数上限见 `CHAT_MCP_CODE_MAX_CALLS`。
+6. **最终答复轮**：将上一轮 assistant（含代码）与 user（【代码执行结果】）留在 `messages` 中，再请求 **`stream: true`** 的 `chat/completions`，将增量正文 **yield** 给前端。
 
-**分工**：选哪个 tool、填什么参数 —— **模型**；是否执行、执行结果写回 —— **本服务**。
+**分工**：如何编排 `await mcp.xxx(...)` —— **模型**；是否在沙盒里执行、如何转发 MCP —— **本服务**。
 
 ---
 
@@ -126,10 +128,10 @@
 用户输入
   → chatbot 组 messages（含记忆、熵过滤）
   → listTools() 拉取 MCP 工具定义（可能因体积限制只带部分工具）
-  → 转为 DeepSeek tools[] + 压缩/截断
-  → 循环（至多 MAX_TOOL_ROUNDS）：chat completions (tool_choice=auto)
-        → 仅当响应含 tool_calls 时对其中条目 callTool，并追加 tool 结果
-        → 直到某次无 tool_calls，得到最终 assistant 正文
+  → 生成 mcp 门面文本 + system 说明（非 tools API）
+  → 非流式：模型产出 fenced 代码 → vm 沙盒执行 → callTool
+  → 必要时多轮「无代码 / 执行失败 → 重试仅输出代码块」（有上限）
+  → 流式：模型根据【代码执行结果】产出最终 assistant 正文
   → 写入 session.turns，摘要/裁切逻辑照旧
 ```
 
@@ -142,14 +144,18 @@
 | `src/server/mcp.ts` | MCP 配置解析、Client 连接、`McpPool` |
 | `src/server/app.ts` | 挂载 MCP HTTP 调试接口、注入 `mcp` 到 `createMemoryChatbot` |
 | `src/server/chatbot.ts` | 判断是否走 `streamChatWithMcpTools` |
-| `src/server/chat-mcp-tools.ts` | DeepSeek tools 循环、体积控制、调用 `mcp.callTool` |
-| 仓库根 `.env.example` | `MCP_SERVERS`、`MCP_FILESYSTEM_ROOT`、`CHAT_MCP_*` 等说明 |
+| `src/server/chat-mcp-limits.ts` | `CHAT_MCP_*` 体积与 `CHAT_MCP_CODE_*` 沙盒限额 |
+| `src/server/mcp-facade-prompt.ts` | JSON Schema → TS 占位、`mcp` 门面字符串、工具键映射 |
+| `src/server/mcp-code-sandbox.ts` | vm 沙盒、`mcp`/`__call_mcp__` → `callTool` |
+| `src/server/chat-mcp-tools.ts` | 多轮代码生成/重试、沙盒调用、最终流式 |
+| 仓库根 `.env.example` | `MCP_SERVERS`、`MCP_FILESYSTEM_ROOT`、`CHAT_MCP_*`、`CHAT_MCP_CODE_*` 等说明 |
 
 ---
 
 ## 7. 依赖版本说明
 
 - MCP 协议交互依赖 **`@modelcontextprotocol/sdk`** 中的 `Client`、`StdioClientTransport`、`StreamableHTTPClientTransport`。
-- 大模型侧使用与 **OpenAI Chat Completions** 兼容的字段：`messages`、`tools`、`tool_choice`。
+- 大模型侧：MCP 路径使用 **`messages` + 非流式/流式** `chat/completions`；**不再**对 MCP 使用 `tools` / `tool_choice`。
+- 沙盒使用 Node 内置 **`node:vm`**（非进程级强隔离，生产环境若需更强隔离可再评估子进程或 `isolated-vm` 等方案）。
 
 （文档随当前代码结构编写；若你改动路由或环境变量名，请同步更新本节与 `.env.example`。）

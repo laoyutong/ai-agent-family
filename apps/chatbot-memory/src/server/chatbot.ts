@@ -20,7 +20,7 @@ export type MemoryChatbotOptions = {
   systemPrompt?: string;
   baseURL?: string;
   apiKey?: string;
-  /** 传入则在本轮可走 Function Calling + MCP：listTools 只注册定义，仅模型请求的 tool 会 callTool */
+  /** 传入则在本轮可走 MCP 代码沙盒路径：先 listTools 一次，结果传入 streamChatWithMcpTools 生成门面 */
   mcp?: McpPool;
 };
 
@@ -50,7 +50,7 @@ export function createMemoryChatbot(options?: MemoryChatbotOptions) {
 
   /**
    * 单轮用户消息：取/建会话 → 组 messages（可选熵过滤）
-   * → 若 MCP 有工具则走 streamChatWithMcpTools（多轮 tool 直至模型出正文），否则 DeepSeek 流式
+   * → 若 MCP 有工具则走 streamChatWithMcpTools（代码沙盒 + 最终流式），否则 DeepSeek 流式
    * → 写入 turns → 摘要/裁切队列。
    */
   async function* streamChat(input: string, sessionId: string): AsyncGenerator<string> {
@@ -107,6 +107,7 @@ export function createMemoryChatbot(options?: MemoryChatbotOptions) {
             model,
             temperature,
             messages,
+            toolsList: listed,
           })) {
             assistantFull += chunk;
             yield chunk;
