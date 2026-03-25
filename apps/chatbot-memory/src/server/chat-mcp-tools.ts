@@ -21,6 +21,62 @@ type ChatMessageForMcp =
  */
 const MAX_MCP_CODE_ROUNDS = 16;
 
+const MCP_SANDBOX_ROUTER_SYSTEM = `你是路由助手。根据「用户消息」与「可用 MCP 工具」判断：本轮是否必须调用至少一个工具（读文件、列目录、搜索、外部 API 等）才能正确回答。
+- 若仅需常识、闲聊、逻辑推理、或仅用已有对话上下文即可回答，回复 NO。
+- 若需要访问工作区文件、运行工具、查询外部数据等，回复 YES。
+只输出一行：YES 或 NO，不要其他文字。`;
+
+function buildMcpRouterToolsHint(
+  listed: Awaited<ReturnType<McpPool["listTools"]>>,
+  limits: ChatMcpPayloadLimits,
+): string {
+  const slice = listed.slice(0, limits.maxTools);
+  const lines: string[] = [];
+  let bytes = 0;
+  const maxBytes = 14_000;
+  for (const t of slice) {
+    const desc = clipText((t.description ?? "").trim(), 200);
+    const line = `- ${t.serverId}/${t.name}${desc ? `: ${desc}` : ""}`;
+    const b = Buffer.byteLength(line, "utf8") + 1;
+    if (bytes + b > maxBytes) break;
+    bytes += b;
+    lines.push(line);
+  }
+  return lines.join("\n");
+}
+
+/**
+ * 本轮是否应走「生成代码 → 沙盒」链路。为省 token 使用短非流式补全；解析失败时默认 true（宁可多走 MCP）。
+ */
+export async function shouldUseMcpSandboxForTurn(options: {
+  chatUrl: string;
+  apiKey: string;
+  model: string;
+  /** 本轮用户正文（与发给主对话的一致） */
+  userMessage: string;
+  listed: Awaited<ReturnType<McpPool["listTools"]>>;
+  limits: ChatMcpPayloadLimits;
+}): Promise<boolean> {
+  const toolsHint = buildMcpRouterToolsHint(options.listed, options.limits);
+  const { content } = await fetchChatCompletionNonStream({
+    chatUrl: options.chatUrl,
+    apiKey: options.apiKey,
+    model: options.model,
+    temperature: 0,
+    maxTokens: 8,
+    messages: [
+      { role: "system", content: MCP_SANDBOX_ROUTER_SYSTEM },
+      {
+        role: "user",
+        content: `【可用工具】\n${toolsHint}\n\n【用户消息】\n${options.userMessage}`,
+      },
+    ],
+  });
+  const text = (content ?? "").trim().toUpperCase();
+  if (/\bNO\b/.test(text) && !/\bYES\b/.test(text)) return false;
+  return true;
+}
+
 function formatExecutionResultForLlm(
   sandbox: Awaited<ReturnType<typeof runMcpSandboxCode>>,
   noCodeFallback: string | null,

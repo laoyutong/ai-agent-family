@@ -13,20 +13,26 @@ export async function fetchChatCompletionNonStream(options: {
   model: string;
   temperature: number;
   messages: ChatCompletionMessageRow[];
+  /** 短路由/分类等非流式调用可限制输出长度以省 token */
+  maxTokens?: number;
 }): Promise<{ content?: string | null }> {
-  const { chatUrl, apiKey, model, temperature, messages } = options;
+  const { chatUrl, apiKey, model, temperature, messages, maxTokens } = options;
+  const body: Record<string, unknown> = {
+    model,
+    temperature,
+    messages,
+    stream: false,
+  };
+  if (maxTokens != null && maxTokens > 0) {
+    body.max_tokens = maxTokens;
+  }
   const res = await fetch(chatUrl, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
       Authorization: `Bearer ${apiKey}`,
     },
-    body: JSON.stringify({
-      model,
-      temperature,
-      messages,
-      stream: false,
-    }),
+    body: JSON.stringify(body),
   });
   if (!res.ok) {
     const errText = await res.text();

@@ -1,12 +1,13 @@
 import "./load-env.js";
-import { loadMemoryChatbotBehaviorConfig } from "./chat-env.js";
+import { loadMemoryChatbotBehaviorConfig, parseEnvBool } from "./chat-env.js";
 import type { SessionMemory } from "./chat-types.js";
 import { createCompleteNonStreaming, joinUrl } from "./deepseek-client.js";
 import { parseSseDataLine } from "./deepseek-sse.js";
 import { filterDialogueByEntropyPrinciple } from "./entropy-ppl-filter.js";
 import { createEnqueueFold, createMemoryFold } from "./memory-fold.js";
 import { popIncrementalSummaryBatch, totalTurnChars, trimTurnsIfOverLimit } from "./memory-turns.js";
-import { streamChatWithMcpTools } from "./chat-mcp-tools.js";
+import { loadChatMcpPayloadLimits } from "./chat-mcp-limits.js";
+import { shouldUseMcpSandboxForTurn, streamChatWithMcpTools } from "./chat-mcp-tools.js";
 import { buildSystemContent } from "./system-content.js";
 import type { McpPool } from "./mcp.js";
 import type { SessionStore } from "./session-store.js";
@@ -68,7 +69,7 @@ export function createMemoryChatbot(options?: MemoryChatbotOptions) {
 
   /**
    * 单轮用户消息：取/建会话 → 组 messages（可选熵过滤）
-   * → 若 MCP 有工具则走 streamChatWithMcpTools（代码沙盒 + 最终流式），否则 DeepSeek 流式
+   * → 若 MCP 有工具且路由判定需要外部能力则走 streamChatWithMcpTools（代码沙盒 + 最终流式），否则 DeepSeek 流式
    * → 写入 turns → 摘要/裁切队列。
    */
   async function* streamChat(input: string, sessionId: string): AsyncGenerator<string> {
@@ -114,29 +115,47 @@ export function createMemoryChatbot(options?: MemoryChatbotOptions) {
       try {
         const listed = await mcpPool.listTools();
         if (listed.length > 0) {
-          let assistantFull = "";
-          for await (const chunk of streamChatWithMcpTools({
-            mcp: mcpPool,
-            chatBaseUrl: baseURL,
-            apiKey: apiKey!,
-            model,
-            temperature,
-            messages,
-            toolsList: listed,
-          })) {
-            assistantFull += chunk;
-            yield chunk;
+          const limits = loadChatMcpPayloadLimits();
+          let useMcpPath = true;
+          if (parseEnvBool("CHAT_MCP_TURN_ROUTER", true)) {
+            try {
+              useMcpPath = await shouldUseMcpSandboxForTurn({
+                chatUrl,
+                apiKey: apiKey!,
+                model,
+                userMessage: userContentForApi,
+                listed,
+                limits,
+              });
+            } catch (e) {
+              console.error("MCP 路由判断失败，回退为走 MCP 路径:", e);
+            }
           }
-          session.turns.push({ role: "user", content: input });
-          session.turns.push({ role: "assistant", content: assistantFull });
-          sessionStore?.onTurnCommitted(sessionId, input, wasEmptyBeforeTurn);
+          if (useMcpPath) {
+            let assistantFull = "";
+            for await (const chunk of streamChatWithMcpTools({
+              mcp: mcpPool,
+              chatBaseUrl: baseURL,
+              apiKey: apiKey!,
+              model,
+              temperature,
+              messages,
+              toolsList: listed,
+            })) {
+              assistantFull += chunk;
+              yield chunk;
+            }
+            session.turns.push({ role: "user", content: input });
+            session.turns.push({ role: "assistant", content: assistantFull });
+            sessionStore?.onTurnCommitted(sessionId, input, wasEmptyBeforeTurn);
 
-          const droppedIncremental = popIncrementalSummaryBatch(session, behavior.incrementalSummaryEveryNPairs);
-          enqueueFold(session, droppedIncremental, "incremental", sessionId);
+            const droppedIncremental = popIncrementalSummaryBatch(session, behavior.incrementalSummaryEveryNPairs);
+            enqueueFold(session, droppedIncremental, "incremental", sessionId);
 
-          const droppedTrim = trimTurnsIfOverLimit(session, behavior);
-          enqueueFold(session, droppedTrim, "trim", sessionId);
-          return;
+            const droppedTrim = trimTurnsIfOverLimit(session, behavior);
+            enqueueFold(session, droppedTrim, "trim", sessionId);
+            return;
+          }
         }
       } catch (e) {
         console.error("MCP 工具对话失败，回退为普通流式:", e);
