@@ -1,10 +1,11 @@
 import express from "express";
 import { createMemoryChatbot } from "./chatbot.js";
 import { createDisabledMcpPool, createMcpPool, type McpPool } from "./mcp.js";
+import { createSessionStore, type SessionStore } from "./session-store.js";
 
 export type ApiAppResult = {
   app: express.Application;
-  /** 释放 MCP 子进程与 HTTP 会话 */
+  /** 刷盘会话、释放 MCP 子进程与 HTTP 会话 */
   shutdown: () => Promise<void>;
 };
 
@@ -23,7 +24,8 @@ export async function createApiApp(): Promise<ApiAppResult> {
     mcp = createDisabledMcpPool();
   }
 
-  const bot = createMemoryChatbot({ mcp });
+  const sessionStore: SessionStore = await createSessionStore();
+  const bot = createMemoryChatbot({ mcp, sessionStore });
 
   const app = express();
   app.use(express.json({ limit: "1mb" }));
@@ -120,8 +122,67 @@ export async function createApiApp(): Promise<ApiAppResult> {
     res.json({ ok: true });
   });
 
+  app.get("/api/sessions", (_req, res) => {
+    res.json({ sessions: sessionStore.listSessions() });
+  });
+
+  app.post("/api/sessions", (_req, res) => {
+    const id = sessionStore.createSession();
+    res.status(201).json({ id });
+  });
+
+  app.get("/api/sessions/:sessionId", (req, res) => {
+    const sessionId = typeof req.params.sessionId === "string" ? req.params.sessionId.trim() : "";
+    if (!sessionId) {
+      res.status(400).json({ error: "缺少 sessionId" });
+      return;
+    }
+    const payload = sessionStore.getSessionPayload(sessionId);
+    if (!payload) {
+      res.status(404).json({ error: "会话不存在" });
+      return;
+    }
+    res.json(payload);
+  });
+
+  app.patch("/api/sessions/:sessionId", (req, res) => {
+    const sessionId = typeof req.params.sessionId === "string" ? req.params.sessionId.trim() : "";
+    const title = typeof req.body?.title === "string" ? req.body.title.trim() : "";
+    if (!sessionId) {
+      res.status(400).json({ error: "缺少 sessionId" });
+      return;
+    }
+    if (!sessionStore.has(sessionId)) {
+      res.status(404).json({ error: "会话不存在" });
+      return;
+    }
+    if (!title) {
+      res.status(400).json({ error: "title 不能为空" });
+      return;
+    }
+    sessionStore.setTitle(sessionId, title);
+    res.json({ ok: true });
+  });
+
+  app.delete("/api/sessions/:sessionId", (req, res) => {
+    const sessionId = typeof req.params.sessionId === "string" ? req.params.sessionId.trim() : "";
+    if (!sessionId) {
+      res.status(400).json({ error: "缺少 sessionId" });
+      return;
+    }
+    const ok = sessionStore.deleteSession(sessionId);
+    if (!ok) {
+      res.status(404).json({ error: "会话不存在" });
+      return;
+    }
+    res.json({ ok: true });
+  });
+
   return {
     app,
-    shutdown: () => mcp.close(),
+    shutdown: async () => {
+      await sessionStore.flushPending();
+      await mcp.close();
+    },
   };
 }

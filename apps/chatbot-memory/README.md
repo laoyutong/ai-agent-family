@@ -36,7 +36,12 @@ pnpm start
 | 方法 | 路径 | 说明 |
 |------|------|------|
 | POST | `/api/chat` | Body: `{ "message": "..." }`，Header: `X-Session-Id`（可选）。响应为 **SSE**（`text/event-stream`），每条 `data:` 为 JSON：`{ "text": "片段" }`，结束为 `{ "done": true }`，错误为 `{ "error": "..." }` |
-| POST | `/api/clear` | 清空该 `X-Session-Id` 对应的记忆 |
+| POST | `/api/clear` | 清空该 `X-Session-Id` 对应会话的逐轮记忆与摘要层（**不**删除会话条目） |
+| GET | `/api/sessions` | 列出会话：`{ "sessions": [ { "id", "title", "updatedAt" } ] }` |
+| POST | `/api/sessions` | 新建空会话，返回 `{ "id" }` |
+| GET | `/api/sessions/:sessionId` | 返回该会话的 `turns`、`summary`、`facts`、`title`、`updatedAt` |
+| PATCH | `/api/sessions/:sessionId` | Body: `{ "title": "..." }` 重命名 |
+| DELETE | `/api/sessions/:sessionId` | 删除整个会话 |
 
 ## 环境变量
 
@@ -45,3 +50,4 @@ pnpm start
 | 变量 | 说明 |
 |------|------|
 | `PORT` | 开发默认 `5173`；生产 `pnpm start` 默认 `3001` |
+| `CHAT_SESSION_STORE_PATH` | 会话持久化 JSON 路径；未设置时默认为用户目录下 `~/.chatbot-memory/sessions.json` |

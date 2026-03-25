@@ -89,35 +89,45 @@ export function createMemoryFold(completeNonStreaming: CompleteNonStreaming) {
 export function createEnqueueFold(
   foldDroppedIntoLayers: ReturnType<typeof createMemoryFold>["foldDroppedIntoLayers"],
   summarizeOnTrim: boolean,
+  options?: {
+    /** 单次折叠 promise 结束后调用（如写入会话持久化） */
+    onFoldSettled?: (sessionId: string) => void;
+  },
 ): (
   session: SessionMemory,
   dropped: ChatMessage[],
   mode: "incremental" | "trim",
+  sessionId?: string,
 ) => void {
   /** 将 `dropped` 异步合并进会话的 summary/facts（不阻塞调用方） */
   return function enqueueFold(
     session: SessionMemory,
     dropped: ChatMessage[],
     mode: "incremental" | "trim",
+    sessionId?: string,
   ): void {
     if (dropped.length === 0) return;
     if (mode === "trim" && !summarizeOnTrim) return;
 
-    session.foldChain = (session.foldChain ?? Promise.resolve()).then(async () => {
-      try {
-        const { summary, facts } = await foldDroppedIntoLayers(
-          session.summary,
-          session.facts,
-          dropped,
-        );
-        session.summary = summary.trim() || undefined;
-        session.facts = facts.trim() || undefined;
-      } catch (e) {
-        console.error(
-          mode === "incremental" ? "incremental summary fold failed:" : "chat history summarize failed:",
-          e,
-        );
-      }
-    });
+    session.foldChain = (session.foldChain ?? Promise.resolve())
+      .then(async () => {
+        try {
+          const { summary, facts } = await foldDroppedIntoLayers(
+            session.summary,
+            session.facts,
+            dropped,
+          );
+          session.summary = summary.trim() || undefined;
+          session.facts = facts.trim() || undefined;
+        } catch (e) {
+          console.error(
+            mode === "incremental" ? "incremental summary fold failed:" : "chat history summarize failed:",
+            e,
+          );
+        }
+      })
+      .finally(() => {
+        if (sessionId) options?.onFoldSettled?.(sessionId);
+      });
   };
 }

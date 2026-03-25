@@ -5,33 +5,45 @@ import { readUtf8StreamChunks } from "../shared/stream-read.js";
 const app = document.querySelector<HTMLDivElement>("#app");
 if (!app) throw new Error("#app missing");
 
-const SESSION_KEY = "chatbot-memory-session";
+/** 当前选中的会话 id（与 X-Session-Id 一致） */
+let currentSessionId = "";
 
-function getSessionId(): string {
+const ACTIVE_SESSION_KEY = "chatbot-memory-active-session";
+const LEGACY_SESSION_KEY = "chatbot-memory-session";
+
+const WELCOME_TEXT =
+  "你好，我是 **知忆**——你的记忆型对话伙伴。我会记住对话中的偏好与事实，让交流更连贯。从任意话题开始都可以。";
+
+type SessionMeta = { id: string; title: string; updatedAt: number };
+
+function migrateLegacySessionId(): void {
   try {
-    let id = sessionStorage.getItem(SESSION_KEY);
-    if (!id) {
-      id = crypto.randomUUID();
-      sessionStorage.setItem(SESSION_KEY, id);
+    const hasActive = localStorage.getItem(ACTIVE_SESSION_KEY);
+    const legacy = sessionStorage.getItem(LEGACY_SESSION_KEY);
+    if (!hasActive && legacy) {
+      localStorage.setItem(ACTIVE_SESSION_KEY, legacy);
+      sessionStorage.removeItem(LEGACY_SESSION_KEY);
     }
-    return id;
   } catch {
-    return "anonymous";
+    /* private mode */
   }
 }
 
-const sessionId = getSessionId();
-
 app.innerHTML = `
   <div class="shell">
-    <aside class="sidebar" aria-label="对话导航">
-      <div class="sidebar-title">话题</div>
+    <aside class="sidebar" aria-label="会话与话题">
+      <div class="sidebar-title">会话</div>
+      <div class="session-toolbar">
+        <button type="button" class="btn ghost session-new-btn" id="new-session">新会话</button>
+      </div>
+      <nav class="session-list" id="session-list" aria-label="会话列表"></nav>
+      <div class="sidebar-title sidebar-title-topic">话题</div>
       <nav class="question-list" id="question-list"></nav>
     </aside>
     <div class="layout">
       <header class="header">
         <h1>知忆</h1>
-        <p class="sub">会话记忆 · 连贯上下文。侧栏可跳转至任意一轮；地址栏加 <code>#q-1</code>、<code>#a-1</code> 亦可直达</p>
+        <p class="sub">多会话持久化至本机 · 侧栏切换会话；话题可跳转至任意一轮；地址栏 <code>#q-1</code>、<code>#a-1</code></p>
       </header>
       <main class="chat" id="chat"></main>
     </div>
@@ -53,10 +65,12 @@ composerWrap.innerHTML = `
 document.body.appendChild(composerWrap);
 
 const chatEl = app.querySelector<HTMLDivElement>("#chat")!;
+const sessionListEl = app.querySelector<HTMLDivElement>("#session-list")!;
 const questionListEl = app.querySelector<HTMLDivElement>("#question-list")!;
 const inputEl = composerWrap.querySelector<HTMLTextAreaElement>("#input")!;
 const sendBtn = composerWrap.querySelector<HTMLButtonElement>("#send")!;
 const clearBtn = composerWrap.querySelector<HTMLButtonElement>("#clear")!;
+const newSessionBtn = app.querySelector<HTMLButtonElement>("#new-session")!;
 
 /** 当前轮次：每发一条用户问题 +1，用于 q-n / a-n 配对 */
 let turnIndex = 0;
@@ -210,6 +224,205 @@ function parseSseBlocks(buffer: string): { events: Record<string, unknown>[]; re
   return { events, rest };
 }
 
+async function fetchSessionList(): Promise<SessionMeta[]> {
+  const res = await fetch("/api/sessions");
+  if (!res.ok) throw new Error(await res.text());
+  const data = (await res.json()) as { sessions?: SessionMeta[] };
+  return data.sessions ?? [];
+}
+
+function renderSessionList(sessions: SessionMeta[]): void {
+  sessionListEl.innerHTML = "";
+  for (const s of sessions) {
+    const row = document.createElement("div");
+    row.className = "session-row";
+    if (s.id === currentSessionId) row.classList.add("is-active");
+
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "session-item";
+    btn.textContent = truncatePreview(s.title, 40);
+    btn.title = s.title;
+    btn.addEventListener("click", () => {
+      void switchToSession(s.id);
+    });
+
+    const del = document.createElement("button");
+    del.type = "button";
+    del.className = "session-delete";
+    del.setAttribute("aria-label", "删除会话");
+    del.textContent = "×";
+    del.addEventListener("click", (e) => {
+      e.stopPropagation();
+      void deleteSessionById(s.id);
+    });
+
+    row.appendChild(btn);
+    row.appendChild(del);
+    sessionListEl.appendChild(row);
+  }
+}
+
+async function refreshSessionList(): Promise<void> {
+  try {
+    const sessions = await fetchSessionList();
+    renderSessionList(sessions);
+  } catch {
+    /* ignore */
+  }
+}
+
+async function hydrateSession(id: string): Promise<void> {
+  const res = await fetch(`/api/sessions/${encodeURIComponent(id)}`);
+  if (res.status === 404) {
+    const cr = await fetch("/api/sessions", { method: "POST" });
+    if (!cr.ok) throw new Error(await cr.text());
+    const { id: nid } = (await cr.json()) as { id: string };
+    currentSessionId = nid;
+    try {
+      localStorage.setItem(ACTIVE_SESSION_KEY, nid);
+    } catch {
+      /* */
+    }
+    await hydrateSession(nid);
+    return;
+  }
+  if (!res.ok) throw new Error(await res.text());
+
+  const payload = (await res.json()) as {
+    turns: Array<{ role: string; content: string }>;
+  };
+
+  chatEl.innerHTML = "";
+  turnIndex = 0;
+  clearQuestionNav();
+  renderIntroNav();
+
+  const turns = payload.turns;
+  for (let i = 0; i < turns.length; i += 2) {
+    const u = turns[i];
+    const a = turns[i + 1];
+    if (u?.role === "user" && a?.role === "assistant") {
+      appendBubble("user", u.content);
+      appendBubble("assistant", a.content);
+    } else if (u?.role === "user") {
+      appendBubble("user", u.content);
+    }
+  }
+
+  if (turns.length === 0) {
+    appendBubble("assistant", WELCOME_TEXT, { kind: "welcome" });
+  }
+
+  queueMicrotask(() => {
+    scrollToHashIfPresent();
+  });
+}
+
+async function switchToSession(id: string): Promise<void> {
+  if (id === currentSessionId) return;
+  currentSessionId = id;
+  try {
+    localStorage.setItem(ACTIVE_SESSION_KEY, id);
+  } catch {
+    /* */
+  }
+  await hydrateSession(id);
+  await refreshSessionList();
+}
+
+async function deleteSessionById(id: string): Promise<void> {
+  const res = await fetch(`/api/sessions/${encodeURIComponent(id)}`, { method: "DELETE" });
+  if (!res.ok) return;
+
+  const sessions = await fetchSessionList();
+  if (id !== currentSessionId) {
+    await refreshSessionList();
+    return;
+  }
+
+  if (sessions.length === 0) {
+    const cr = await fetch("/api/sessions", { method: "POST" });
+    const { id: nid } = (await cr.json()) as { id: string };
+    currentSessionId = nid;
+    try {
+      localStorage.setItem(ACTIVE_SESSION_KEY, nid);
+    } catch {
+      /* */
+    }
+    await hydrateSession(nid);
+  } else {
+    const next = sessions[0].id;
+    currentSessionId = next;
+    try {
+      localStorage.setItem(ACTIVE_SESSION_KEY, next);
+    } catch {
+      /* */
+    }
+    await hydrateSession(next);
+  }
+  await refreshSessionList();
+}
+
+async function createNewSession(): Promise<void> {
+  const res = await fetch("/api/sessions", { method: "POST" });
+  if (!res.ok) throw new Error(await res.text());
+  const { id } = (await res.json()) as { id: string };
+  currentSessionId = id;
+  try {
+    localStorage.setItem(ACTIVE_SESSION_KEY, id);
+  } catch {
+    /* */
+  }
+  await hydrateSession(id);
+  await refreshSessionList();
+}
+
+async function resolveInitialSession(): Promise<void> {
+  migrateLegacySessionId();
+
+  let sessions = await fetchSessionList();
+
+  let preferred = "";
+  try {
+    preferred = localStorage.getItem(ACTIVE_SESSION_KEY) ?? "";
+  } catch {
+    /* */
+  }
+
+  const ids = new Set(sessions.map((s) => s.id));
+
+  if (sessions.length === 0) {
+    const cr = await fetch("/api/sessions", { method: "POST" });
+    if (!cr.ok) throw new Error(await cr.text());
+    const { id } = (await cr.json()) as { id: string };
+    currentSessionId = id;
+    try {
+      localStorage.setItem(ACTIVE_SESSION_KEY, id);
+    } catch {
+      /* */
+    }
+    await hydrateSession(id);
+    await refreshSessionList();
+    return;
+  }
+
+  if (preferred && ids.has(preferred)) {
+    currentSessionId = preferred;
+  } else {
+    currentSessionId = sessions[0].id;
+    try {
+      localStorage.setItem(ACTIVE_SESSION_KEY, currentSessionId);
+    } catch {
+      /* */
+    }
+  }
+
+  await hydrateSession(currentSessionId);
+  sessions = await fetchSessionList();
+  renderSessionList(sessions);
+}
+
 async function send(): Promise<void> {
   const text = inputEl.value.trim();
   if (!text) return;
@@ -225,7 +438,7 @@ async function send(): Promise<void> {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        "X-Session-Id": sessionId,
+        "X-Session-Id": currentSessionId,
         Accept: "text/event-stream",
       },
       body: JSON.stringify({ message: text }),
@@ -291,6 +504,8 @@ async function send(): Promise<void> {
     if (assistantEl.classList.contains("is-pending")) {
       setAssistantMarkdown(assistantEl, assistantMd.trim() ? assistantMd : "（本次未收到内容）");
     }
+
+    void refreshSessionList();
   } catch (e) {
     clearAssistantPending(assistantEl);
     assistantEl.textContent = `网络错误：${e instanceof Error ? e.message : String(e)}`;
@@ -303,7 +518,6 @@ async function send(): Promise<void> {
 sendBtn.addEventListener("click", () => void send());
 inputEl.addEventListener("keydown", (e) => {
   if (e.key !== "Enter" || e.shiftKey) return;
-  // 输入法选字/确认时按回车不应发送（否则会打断组字）
   if (e.isComposing || e.keyCode === 229) return;
   e.preventDefault();
   void send();
@@ -313,25 +527,39 @@ clearBtn.addEventListener("click", async () => {
   try {
     const res = await fetch("/api/clear", {
       method: "POST",
-      headers: { "X-Session-Id": sessionId },
+      headers: { "X-Session-Id": currentSessionId },
     });
     if (!res.ok) throw new Error(await res.text());
     chatEl.innerHTML = "";
     turnIndex = 0;
     clearQuestionNav();
+    renderIntroNav();
     appendBubble("assistant", "已清空本会话记忆，我们可以从头开始。", { kind: "system" });
+    void refreshSessionList();
   } catch (e) {
     appendBubble("assistant", `清空失败：${e instanceof Error ? e.message : String(e)}`, { kind: "system" });
   }
 });
 
-renderIntroNav();
-appendBubble(
-  "assistant",
-  "你好，我是 **知忆**——你的记忆型对话伙伴。我会记住对话中的偏好与事实，让交流更连贯。从任意话题开始都可以。",
-  { kind: "welcome" },
-);
+newSessionBtn.addEventListener("click", () => void createNewSession());
 
-queueMicrotask(() => {
-  scrollToHashIfPresent();
-});
+async function bootstrap(): Promise<void> {
+  sendBtn.disabled = true;
+  clearBtn.disabled = true;
+  newSessionBtn.disabled = true;
+  try {
+    await resolveInitialSession();
+  } catch (e) {
+    appendBubble(
+      "assistant",
+      `初始化失败：${e instanceof Error ? e.message : String(e)}。请确认已启动服务并配置 DEEPSEEK_API_KEY。`,
+      { kind: "system" },
+    );
+  } finally {
+    sendBtn.disabled = false;
+    clearBtn.disabled = false;
+    newSessionBtn.disabled = false;
+  }
+}
+
+void bootstrap();

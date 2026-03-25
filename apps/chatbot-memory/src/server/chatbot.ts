@@ -9,9 +9,10 @@ import { popIncrementalSummaryBatch, totalTurnChars, trimTurnsIfOverLimit } from
 import { streamChatWithMcpTools } from "./chat-mcp-tools.js";
 import { buildSystemContent } from "./system-content.js";
 import type { McpPool } from "./mcp.js";
+import type { SessionStore } from "./session-store.js";
 import { readUtf8Lines } from "../shared/stream-read.js";
 
-const sessions = new Map<string, SessionMemory>();
+const fallbackSessions = new Map<string, SessionMemory>();
 
 /** 仅覆盖 API 与人设；记忆策略、熵过滤等见环境变量 */
 export type MemoryChatbotOptions = {
@@ -22,6 +23,8 @@ export type MemoryChatbotOptions = {
   apiKey?: string;
   /** 传入则在本轮可走 MCP 代码沙盒路径：先 listTools 一次，结果传入 streamChatWithMcpTools 生成门面 */
   mcp?: McpPool;
+  /** 传入则多会话持久化到本地文件；不传则仅内存 Map（与旧行为一致） */
+  sessionStore?: SessionStore;
 };
 
 /**
@@ -30,6 +33,7 @@ export type MemoryChatbotOptions = {
  */
 export function createMemoryChatbot(options?: MemoryChatbotOptions) {
   const mcpPool = options?.mcp;
+  const sessionStore = options?.sessionStore;
   const apiKey = options?.apiKey ?? process.env.DEEPSEEK_API_KEY;
   const baseURL = options?.baseURL ?? process.env.DEEPSEEK_BASE_URL ?? "https://api.deepseek.com";
   const model = options?.model ?? process.env.DEEPSEEK_MODEL ?? "deepseek-chat";
@@ -46,7 +50,21 @@ export function createMemoryChatbot(options?: MemoryChatbotOptions) {
     defaultModel: model,
   });
   const { foldDroppedIntoLayers } = createMemoryFold(completeNonStreaming);
-  const enqueueFold = createEnqueueFold(foldDroppedIntoLayers, behavior.summarizeOnTrim);
+  const enqueueFold = createEnqueueFold(foldDroppedIntoLayers, behavior.summarizeOnTrim, {
+    onFoldSettled: sessionStore ? (id) => sessionStore.onFoldSettled(id) : undefined,
+  });
+
+  function getSession(sessionId: string): SessionMemory {
+    if (sessionStore) {
+      return sessionStore.getOrCreateMemory(sessionId);
+    }
+    let session = fallbackSessions.get(sessionId);
+    if (!session) {
+      session = { turns: [] };
+      fallbackSessions.set(sessionId, session);
+    }
+    return session;
+  }
 
   /**
    * 单轮用户消息：取/建会话 → 组 messages（可选熵过滤）
@@ -58,11 +76,8 @@ export function createMemoryChatbot(options?: MemoryChatbotOptions) {
       throw new Error("未配置 DEEPSEEK_API_KEY");
     }
 
-    let session = sessions.get(sessionId);
-    if (!session) {
-      session = { turns: [] };
-      sessions.set(sessionId, session);
-    }
+    const session = getSession(sessionId);
+    const wasEmptyBeforeTurn = session.turns.length === 0;
 
     const systemContent = buildSystemContent(session, systemPrompt);
     let turnsForApi = session.turns;
@@ -114,12 +129,13 @@ export function createMemoryChatbot(options?: MemoryChatbotOptions) {
           }
           session.turns.push({ role: "user", content: input });
           session.turns.push({ role: "assistant", content: assistantFull });
+          sessionStore?.onTurnCommitted(sessionId, input, wasEmptyBeforeTurn);
 
           const droppedIncremental = popIncrementalSummaryBatch(session, behavior.incrementalSummaryEveryNPairs);
-          enqueueFold(session, droppedIncremental, "incremental");
+          enqueueFold(session, droppedIncremental, "incremental", sessionId);
 
           const droppedTrim = trimTurnsIfOverLimit(session, behavior);
-          enqueueFold(session, droppedTrim, "trim");
+          enqueueFold(session, droppedTrim, "trim", sessionId);
           return;
         }
       } catch (e) {
@@ -157,24 +173,39 @@ export function createMemoryChatbot(options?: MemoryChatbotOptions) {
 
     session.turns.push({ role: "user", content: input });
     session.turns.push({ role: "assistant", content: assistantFull });
+    sessionStore?.onTurnCommitted(sessionId, input, wasEmptyBeforeTurn);
 
     const droppedIncremental = popIncrementalSummaryBatch(session, behavior.incrementalSummaryEveryNPairs);
-    enqueueFold(session, droppedIncremental, "incremental");
+    enqueueFold(session, droppedIncremental, "incremental", sessionId);
 
     const droppedTrim = trimTurnsIfOverLimit(session, behavior);
-    enqueueFold(session, droppedTrim, "trim");
+    enqueueFold(session, droppedTrim, "trim", sessionId);
   }
 
   return {
     /** 按会话流式生成助手回复文本片段（AsyncGenerator） */
     stream: (input: string, sessionId: string) => streamChat(input, sessionId),
-    /** 删除指定 `sessionId` 的会话记忆 */
+    /** 清空指定会话的逐轮记忆与摘要层，保留会话 id（与侧栏条目） */
     clearSession: (sessionId: string) => {
-      sessions.delete(sessionId);
+      if (sessionStore) {
+        sessionStore.clearMemory(sessionId);
+      } else {
+        const s = fallbackSessions.get(sessionId);
+        if (s) {
+          s.turns = [];
+          delete s.summary;
+          delete s.facts;
+          s.foldChain = undefined;
+        }
+      }
     },
-    /** 清空内存中全部会话 */
+    /** 清空全部会话（含持久化库中的条目） */
     clearAllSessions: () => {
-      sessions.clear();
+      if (sessionStore) {
+        sessionStore.clearAllSessions();
+      } else {
+        fallbackSessions.clear();
+      }
     },
   };
 }
