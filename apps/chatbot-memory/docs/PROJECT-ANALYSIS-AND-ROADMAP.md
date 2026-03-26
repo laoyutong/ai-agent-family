@@ -125,9 +125,9 @@
 |------|------|
 | **复杂度** | 高 |
 | **价值** | 高 |
-| **现状** | 单次「代码 → 执行 →（多轮重试）→ 最终流式」偏线性。 |
-| **思路** | 先输出结构化 Plan（JSON 步骤），再逐步执行；步骤间传递结果；可选前端步骤进度展示。 |
-| **涉及** | `chat-mcp-tools.ts` 核心扩展、新增 planner 模块、`mcp-facade-prompt.ts` |
+| **现状（已实现）** | 在 `chat-mcp-tools.ts` 中：可选 **先非流式 json 规划**（`mcp-plan-execute.ts`），再 **按步** 「fenced 代码 → `mcp-code-sandbox` → 观测累加」；不满足启用条件或解析失败时回退 **单段代码** 路径。环境变量见 `CHAT_MCP_PLAN_*`；服务端日志带 `[MCP] plan`。详细数据流见 `docs/MCP-CLIENT.md` §4.2。 |
+| **仍可扩展** | 前端步骤进度 / SSE `progress` 事件（与 §3.4 联动）；规划失败时的部分结果恢复；更细的策略（按任务复杂度动态开关规划）。 |
+| **涉及** | `chat-mcp-tools.ts`、`mcp-plan-execute.ts`、`mcp-facade-prompt.ts`、`mcp-code-sandbox.ts` |
 
 ---
 
@@ -197,7 +197,8 @@
 | 路径 | 说明 |
 |------|------|
 | `src/server/chatbot.ts` | 主对话流：熵过滤、MCP 分支、写入 `turns`、入队折叠 |
-| `src/server/chat-mcp-tools.ts` | MCP 路由、代码轮次、最终流式 |
+| `src/server/chat-mcp-tools.ts` | MCP 路由、Plan-Execute / 单段代码、`runMcpSandboxCodegenLoop`、最终流式 |
+| `src/server/mcp-plan-execute.ts` | 多步 json 规划、对话/工具摘要、`parseMcpPlanFromModelText` |
 | `src/server/mcp-code-sandbox.ts` | `vm` 沙盒与 `callTool` 转发 |
 | `src/server/session-store.ts` | 默认按会话分文件 + manifest；可选单文件路径 |
 | `src/server/user-facts-store.ts` | 用户级事实持久化 |
@@ -213,4 +214,4 @@
 | 日期 | 说明 |
 |------|------|
 | 2025-03-25 | 初版：基于仓库实现的分析与路线图整理 |
-| 2025-03-26 | 同步实现：§2.1 LLM 扇出优化；§2.2 分文件持久化；§3.1 用户级事实（存储、system 注入、折叠合并、REST） |
+| 2025-03-26 | 同步实现：§2.1 LLM 扇出；§2.2 分文件持久化；§3.1 用户级事实；§3.3 MCP Plan-Execute 编排（`mcp-plan-execute.ts`）。文档：`MCP-CLIENT.md` §4.2/§6.1；`.env.example`：`CHAT_MCP_PLAN_*` |

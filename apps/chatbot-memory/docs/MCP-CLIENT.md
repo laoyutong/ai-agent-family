@@ -25,8 +25,9 @@
 ┌──────────────────┐   messages（无 tools）  ┌──────────────────┐
 │  chatbot.ts      │ ────────────────────► │ DeepSeek API      │
 │  streamChat      │   mcp-facade-prompt   │ /v1/chat/...     │
+│                  │   mcp-plan-execute    │                  │
 │                  │   mcp-code-sandbox    │                  │
-└──────────────────┘   chat-mcp-tools.ts   └──────────────────┘
+└──────────────────┘   chat-mcp-tools.ts └──────────────────┘
 ```
 
 - **MCP Client**：Node 进程内的 `Client` 实例（每个已连接的服务器一个），负责协议层的 `listTools`、`callTool`。
@@ -114,14 +115,21 @@
 1. **体积控制**：按环境变量限制工具数量、单工具 schema、工具返回长度、整段 `messages` JSON 等，避免 413（见 `loadChatMcpPayloadLimits`，定义于 `chat-mcp-limits.ts`）；必要时**裁减** `listTools()` 子集并缩小生成的 `mcp` 门面文本。
 2. **门面生成**（`mcp-facade-prompt.ts`）：把 `listTools()` 的 `inputSchema` 转成简化的 TypeScript 式参数类型，生成 `declare function __call_mcp__(…)` 与 `export const mcp = { … }` 说明文本；维护 Map：**工具键 → (serverId, MCP toolName)**，与沙盒内注入的 `mcp` 方法一致。
 3. **System 提示**：在首条 system 上追加【MCP 代码执行】说明与门面全文（若尚未包含【MCP 代码执行】标记）。
-4. **代码生成轮**（非流式 `chat/completions`，**不传** `tools`）：
+4. **多步 Plan-Execute 编排（可选，默认开启）**（`mcp-plan-execute.ts` + `runMcpSandboxCodegenLoop`）：
+   - **启用条件**：`CHAT_MCP_PLAN_EXECUTE=true`（默认）且当前合并后的工具条数 ≥ `CHAT_MCP_PLAN_MIN_TOOLS`（默认 `2`）。仅连上 **1 台 MCP 且工具少** 时通常会跳过规划，直接走单段代码路径，避免多一次规划调用。
+   - **Plan（规划）**：单独一次非流式 `chat/completions`（`temperature` 上限约 `0.35`，`max_tokens` 约 `2048`），system 为规划提示；user 含**当前用户问题**、**工具摘要**与**近期对话摘录**（便于消解「那个文件」等指代）。模型只应输出 **一个 `json` fenced 块**，形如 `{ "steps": [ { "id", "goal", "notes?" }, … ] }`。由 `parseMcpPlanFromModelText` 解析；失败则**整轮回退**为下面的单段路径。
+   - **Execute（分步执行）**：对每一步从干净的「对话 + MCP system」副本追加一条 user：当前步骤目标、可选备注，以及 **`【此前步骤观测】`**（前面各步 `formatExecutionResultForLlm` 的合并摘要）。随后进入与单段相同的 **代码生成 ↔ 沙盒** 子循环，子循环重试上限为 `CHAT_MCP_PLAN_STEP_CODE_ROUNDS`（默认 `6`）。任一步在子循环内仍失败则**整轮抛错**（外层 `chatbot.ts` 可回退普通流式）。
+   - **计划长度**：`CHAT_MCP_PLAN_MAX_STEPS`（默认 `8`）截断过长 `steps`，并打 `[MCP]` 日志。
+   - **合并进终答**：多步全部成功后，**不**把中间多对 assistant/user（代码与执行细节）塞进写回 `turns` 的历史；而是用 `options.messages` 的干净副本 + 一条占位 assistant + 一条 user（合并后的 `【代码执行结果】` + 输出要求后缀），再走流式终答。调试时 `CHAT_MCP_ECHO_CODE_IN_CHAT=true` 可按**步** yield 已执行代码块。
+5. **单段代码路径（回退或与规划互斥）**：与原先一致——在单条 user 任务下多轮非流式请求直至拿到可执行代码且沙盒 `ok: true`，或耗尽 **`MAX_MCP_CODE_ROUNDS`**（代码内常量，默认 `16`）。子逻辑由 **`runMcpSandboxCodegenLoop`** 统一实现，与分步共用沙盒与重试语义。
+6. **代码生成轮**（非流式 `chat/completions`，**不传** `tools`）：
    - 模型输出须含 **一个** `javascript` / `typescript` fenced 代码块；解析后交给 `mcp-code-sandbox.ts`。
-   - 若未找到代码块或沙盒执行未成功（且未超过轮次上限），在同一会话中追加 **assistant + user（执行结果 + 重试说明）**，再请求模型**仅**输出修正后的代码块。
-   - 若沙盒执行成功（`ok: true`），进入最终答复轮。
-5. **沙盒执行**（`mcp-code-sandbox.ts`）：`node:vm` 受限上下文，仅暴露 `mcp`、`__call_mcp__`、受限 `console` 与安全内置对象；`Promise.race` 控制**总执行时长**（`CHAT_MCP_CODE_MAX_MS`）；单次执行内 MCP 调用次数上限见 `CHAT_MCP_CODE_MAX_CALLS`。
-6. **最终答复轮**：将上一轮 assistant（含代码）与 user（【代码执行结果】）留在 `messages` 中，再请求 **`stream: true`** 的 `chat/completions`，将增量正文 **yield** 给前端。
+   - 若未找到代码块或沙盒执行未成功（且未超过**当前路径**下的轮次上限），在同一段 `messages` 中追加 **assistant + user（执行结果 + 重试说明）**，再请求模型**仅**输出修正后的代码块。
+   - 若沙盒执行成功（`ok: true`），单段路径进入最终答复轮；多步路径则进入下一步或合并终答。
+7. **沙盒执行**（`mcp-code-sandbox.ts`）：`node:vm` 受限上下文，仅暴露 `mcp`、`__call_mcp__`、受限 `console` 与安全内置对象；`Promise.race` 控制**总执行时长**（`CHAT_MCP_CODE_MAX_MS`）；**每一次 vm 运行**内 MCP 调用次数上限见 `CHAT_MCP_CODE_MAX_CALLS`（多步时**每一步**单独进沙盒，计数**每步重置**）。
+8. **最终答复轮**：流式 `chat/completions`；单段路径下会先 **`prepareMessagesForFinalReply`**，把「含代码的 assistant」换成占位说明，避免终答复述代码。将增量正文 **yield** 给前端。
 
-**分工**：如何编排 `await mcp.xxx(...)` —— **模型**；是否在沙盒里执行、如何转发 MCP —— **本服务**。
+**分工**：**规划**与**每步代码**均由 **模型** 产出；是否在沙盒里执行、步骤间如何拼「观测」字符串、如何转发 MCP —— **本服务**。
 
 ---
 
@@ -133,8 +141,9 @@
   → 组装 messages（记忆 + 熵过滤结果）
   → （可选）MCP 启发式 / 路由 LLM 决定是否走沙盒
   → 若走 MCP：生成 mcp 门面文本 + system 说明（非 tools API）
-  → 非流式：模型产出 fenced 代码 → vm 沙盒执行 → callTool
-  → 必要时多轮「无代码 / 执行失败 → 重试仅输出代码块」（有上限）
+  → （可选）非流式：先产出 json 步骤计划 → 按步重复：非流式 fenced 代码 → vm 沙盒 → callTool；步间附带「此前观测」
+  → 或未规划：单段任务下非流式 fenced 代码 → vm 沙盒 → callTool
+  → 必要时多轮「无代码 / 执行失败 → 重试仅输出代码块」（单段/分步各自有上限）
   → 流式：模型根据【代码执行结果】产出最终 assistant 正文
   → 写入 session.turns，摘要/裁切逻辑照旧
 ```
@@ -151,8 +160,20 @@
 | `src/server/chat-mcp-limits.ts` | `CHAT_MCP_*` 体积与 `CHAT_MCP_CODE_*` 沙盒限额 |
 | `src/server/mcp-facade-prompt.ts` | JSON Schema → TS 占位、`mcp` 门面字符串、工具键映射 |
 | `src/server/mcp-code-sandbox.ts` | vm 沙盒、`mcp`/`__call_mcp__` → `callTool` |
-| `src/server/chat-mcp-tools.ts` | 多轮代码生成/重试、沙盒调用、最终流式；`inferMcpRouteByHeuristic`、路由 LLM |
-| 仓库根 `.env.example` | `MCP_SERVERS`、`MCP_FILESYSTEM_ROOT`、`CHAT_MCP_*`、`CHAT_MCP_CODE_*`、`CHAT_MCP_TURN_ROUTER`、`CHAT_MCP_ROUTER_HEURISTIC` 等说明 |
+| `src/server/chat-mcp-tools.ts` | Plan-Execute / 单段路径、`runMcpSandboxCodegenLoop`、最终流式；`inferMcpRouteByHeuristic`、路由 LLM |
+| `src/server/mcp-plan-execute.ts` | MCP 多步规划提示词、工具/对话摘要、`parseMcpPlanFromModelText` |
+| 仓库根 `.env.example` | `MCP_SERVERS`、`MCP_FILESYSTEM_ROOT`、`CHAT_MCP_*`、`CHAT_MCP_CODE_*`、`CHAT_MCP_PLAN_*`、`CHAT_MCP_TURN_ROUTER`、`CHAT_MCP_ROUTER_HEURISTIC` 等说明 |
+
+### 6.1 与 Plan-Execute 相关的环境变量（摘录）
+
+| 变量 | 默认 | 说明 |
+|------|------|------|
+| `CHAT_MCP_PLAN_EXECUTE` | `true` | 是否先 json 规划再多步执行；`false` 时恒走单段代码路径 |
+| `CHAT_MCP_PLAN_MIN_TOOLS` | `2` | 工具数（`listTools` 合并条数）≥此值才做规划 |
+| `CHAT_MCP_PLAN_MAX_STEPS` | `8` | 规划中 `steps` 最大保留条数 |
+| `CHAT_MCP_PLAN_STEP_CODE_ROUNDS` | `6` | **每一步**内代码生成/沙盒失败时的最大重试轮数 |
+
+其余 `CHAT_MCP_*` / `CHAT_MCP_CODE_*` 仍见 `chat-mcp-limits.ts` 与仓库根 `.env.example`。
 
 ---
 
