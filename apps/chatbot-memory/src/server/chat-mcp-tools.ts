@@ -46,6 +46,42 @@ function buildMcpRouterToolsHint(
 }
 
 /**
+ * 在调用 LLM 路由前做快速预判，减少一次非流式补全。
+ * - `true`：明显需要工具/文件/搜索等，直接走 MCP 路径（不调路由模型）。
+ * - `false`：极短、明显纯寒暄，可跳过 MCP 与 listTools（不调路由模型）。
+ * - `null`：不确定，需调用 `shouldUseMcpSandboxForTurn`。
+ *
+ * 设计偏保守：`false` 仅用于短句寒暄，避免长句误判；`true` 覆盖常见工具意图。
+ */
+export function inferMcpRouteByHeuristic(userMessage: string): boolean | null {
+  const s = userMessage.trim();
+  if (s.length === 0) return null;
+
+  if (
+    /\b(mcp|glob|grep|workspace|filesystem|proto[\-_]?nexus)\b/i.test(s) ||
+    /读(取|一下)?文件|打开文件|列出(目录|文件)|列目录|查找.*(文件|目录)|搜索.*(文件|目录|代码|项目)|文件(路径|列表|内容|树)|工作区|目录下|文件夹里|\.(ts|tsx|js|jsx|json|md|py|yaml|yml)\b/.test(
+      s,
+    ) ||
+    /\b(read|list|search|find|open|glob)\s+(file|folder|directory|path|the\s)/i.test(s) ||
+    /listFiles|readFile|globFile|文件列表|搜(一下|索)|查(一下|看).*代码|仓库里|项目里.*(文件|代码)/i.test(s)
+  ) {
+    return true;
+  }
+
+  if (s.length <= 24) {
+    if (
+      /^(你好|在吗|您好|哈喽|嗨|hi|hello|谢谢|多谢|感谢|再见|拜拜|好的|嗯|ok|OK|是的|不是|可以|不行|明白了|收到|知道了|没问题|辛苦了|早上好|晚上好|午安)[\s。!！?？~～]*$/i.test(
+        s,
+      )
+    ) {
+      return false;
+    }
+  }
+
+  return null;
+}
+
+/**
  * 本轮是否应走「生成代码 → 沙盒」链路。为省 token 使用短非流式补全；解析失败时默认 true（宁可多走 MCP）。
  */
 export async function shouldUseMcpSandboxForTurn(options: {

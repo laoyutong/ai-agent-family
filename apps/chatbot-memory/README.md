@@ -51,3 +51,7 @@ pnpm start
 |------|------|
 | `PORT` | 开发默认 `5173`；生产 `pnpm start` 默认 `3001` |
 | `CHAT_SESSION_STORE_PATH` | 会话存储路径：未设置时默认为目录 `~/.chatbot-memory/sessions/`（每会话一个 `<uuid>.json`，另有 `manifest.json` 索引；仅变更的会话会重写）。若路径以 `.json` 结尾则使用旧版**单文件**全量写入（兼容已有部署） |
+
+## 文档
+
+架构分析、路线图与 MCP 工作流程见 [`docs/`](./docs/README.md)（含与实现对齐的迭代说明）。

@@ -7,7 +7,11 @@ import { filterDialogueByEntropyPrinciple } from "./entropy-ppl-filter.js";
 import { createEnqueueFold, createMemoryFold } from "./memory-fold.js";
 import { popIncrementalSummaryBatch, totalTurnChars, trimTurnsIfOverLimit } from "./memory-turns.js";
 import { loadChatMcpPayloadLimits } from "./chat-mcp-limits.js";
-import { shouldUseMcpSandboxForTurn, streamChatWithMcpTools } from "./chat-mcp-tools.js";
+import {
+  inferMcpRouteByHeuristic,
+  shouldUseMcpSandboxForTurn,
+  streamChatWithMcpTools,
+} from "./chat-mcp-tools.js";
 import { buildSystemContent } from "./system-content.js";
 import type { McpPool } from "./mcp.js";
 import type { SessionStore } from "./session-store.js";
@@ -89,8 +93,19 @@ export function createMemoryChatbot(options?: MemoryChatbotOptions) {
       behavior.entropyPerplexityFilter &&
       (behavior.entropyFilterMinChars === 0 || historyChars >= behavior.entropyFilterMinChars);
 
-    if (shouldEntropyFilter) {
-      const asTurns = turnsForApi as Array<{ role: "user" | "assistant"; content: string }>;
+    const routerEnabled = parseEnvBool("CHAT_MCP_TURN_ROUTER", true);
+    const heuristicEnabled = parseEnvBool("CHAT_MCP_ROUTER_HEURISTIC", true);
+
+    let mcpHeuristic: boolean | null = null;
+    if (mcpPool?.configured && routerEnabled && heuristicEnabled) {
+      mcpHeuristic = inferMcpRouteByHeuristic(input);
+    }
+    const skipMcpByHeuristic = routerEnabled && heuristicEnabled && mcpHeuristic === false;
+    const needToolsList = Boolean(mcpPool?.configured && !skipMcpByHeuristic);
+
+    const asTurns = turnsForApi as Array<{ role: "user" | "assistant"; content: string }>;
+    const entropyPromise = (async () => {
+      if (!shouldEntropyFilter) return;
       try {
         const filtered = await filterDialogueByEntropyPrinciple(
           asTurns,
@@ -103,7 +118,17 @@ export function createMemoryChatbot(options?: MemoryChatbotOptions) {
       } catch (e) {
         console.error("entropy/perplexity context filter failed:", e);
       }
-    }
+    })();
+
+    const toolsPromise =
+      needToolsList && mcpPool
+        ? mcpPool.listTools().catch((e) => {
+            console.error("MCP listTools 失败，将回退为普通流式:", e);
+            return [] as Awaited<ReturnType<McpPool["listTools"]>>;
+          })
+        : Promise.resolve([]);
+
+    const [, listed] = await Promise.all([entropyPromise, toolsPromise]);
 
     const messages = [
       { role: "system" as const, content: systemContent },
@@ -111,13 +136,12 @@ export function createMemoryChatbot(options?: MemoryChatbotOptions) {
       { role: "user" as const, content: userContentForApi },
     ];
 
-    if (mcpPool?.configured) {
+    if (mcpPool?.configured && !skipMcpByHeuristic) {
       try {
-        const listed = await mcpPool.listTools();
         if (listed.length > 0) {
           const limits = loadChatMcpPayloadLimits();
           let useMcpPath = true;
-          if (parseEnvBool("CHAT_MCP_TURN_ROUTER", true)) {
+          if (routerEnabled && mcpHeuristic === null) {
             try {
               useMcpPath = await shouldUseMcpSandboxForTurn({
                 chatUrl,

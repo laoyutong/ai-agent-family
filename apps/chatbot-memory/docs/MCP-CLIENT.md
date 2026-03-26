@@ -97,12 +97,15 @@
 
 ### 4.1 何时走 MCP 工具链路
 
-在 `streamChat` 中，组好本轮要发给模型的 `messages`（system + 历史 turns + 当前 user，并可能经过熵过滤）之后：
+在 `streamChat`（`chatbot.ts`）中，顺序如下（与「先组好 messages 再 listTools」的旧描述不同，已优化首字前等待）：
 
-1. 若 `mcpPool?.configured` 为真，则 `await mcpPool.listTools()`。
-2. 若 `listed.length > 0`，则 **不再** 直接走纯流式 `fetch(…, stream: true)`，而是进入 `streamChatWithMcpTools(…)`。
-3. 若 MCP 路径抛错，会打日志并 **回退** 到无工具的流式对话。
-4. 若未配置 MCP 或工具列表为空，行为与原来一致：仅 DeepSeek 流式补全。
+1. **熵过滤与工具列表并行**：若开启熵过滤且本轮仍可能走 MCP，则 **`Promise.all`** 同时执行 `filterDialogueByEntropyPrinciple` 与 **`mcpPool.listTools()`**（后者在不需要 MCP 时可跳过，见下）。二者都完成后，再组装 `messages`（system + 过滤后的 turns + 当前 user）。
+2. **是否拉工具 / 是否走 MCP**（由环境变量与启发式共同决定）：
+   - **`CHAT_MCP_ROUTER_HEURISTIC`**（默认 `true`）：先对**原始用户输入**调用 **`inferMcpRouteByHeuristic`**。若判定为明显寒暄，可 **跳过** `listTools` 与后续 MCP，直接 DeepSeek 流式；若判定为明显需要工具/文件等，则 **跳过** 路由 LLM，直接进入 MCP 链路（仍需先 `listTools`，已与熵过滤并行完成）。
+   - **`CHAT_MCP_TURN_ROUTER`**（默认 `true`）：在启发式为「不明确」时，用非流式 **`shouldUseMcpSandboxForTurn`**（路由 LLM）判断本轮是否必须走沙盒；为 `false` 时只要 `listTools` 非空即走 MCP（旧行为）。路由 LLM 使用的是 **熵过滤之后** 的当前用户正文，与发给主对话的 `messages` 一致。
+3. 若 `mcpPool?.configured` 为真、`listed.length > 0` 且判定应走 MCP，则进入 **`streamChatWithMcpTools(…)`**，而不是直接纯流式 `fetch(…, stream: true)`。
+4. 若 `listTools` 失败或 MCP 路径抛错，会打日志并 **回退** 到无工具的流式对话。
+5. 若未配置 MCP 或工具列表为空，行为与原来一致：仅 DeepSeek 流式补全。
 
 会话记忆里仍只存 **user / assistant 文本**；代码执行与「【代码执行结果】」等中间消息只在**当轮**与模型的多轮往返中存在，**不**逐条写入 `turns`。
 
@@ -126,9 +129,10 @@
 
 ```
 用户输入
-  → chatbot 组 messages（含记忆、熵过滤）
-  → listTools() 拉取 MCP 工具定义（可能因体积限制只带部分工具）
-  → 生成 mcp 门面文本 + system 说明（非 tools API）
+  → （可选）熵过滤 ∥ listTools() 并行
+  → 组装 messages（记忆 + 熵过滤结果）
+  → （可选）MCP 启发式 / 路由 LLM 决定是否走沙盒
+  → 若走 MCP：生成 mcp 门面文本 + system 说明（非 tools API）
   → 非流式：模型产出 fenced 代码 → vm 沙盒执行 → callTool
   → 必要时多轮「无代码 / 执行失败 → 重试仅输出代码块」（有上限）
   → 流式：模型根据【代码执行结果】产出最终 assistant 正文
@@ -147,8 +151,8 @@
 | `src/server/chat-mcp-limits.ts` | `CHAT_MCP_*` 体积与 `CHAT_MCP_CODE_*` 沙盒限额 |
 | `src/server/mcp-facade-prompt.ts` | JSON Schema → TS 占位、`mcp` 门面字符串、工具键映射 |
 | `src/server/mcp-code-sandbox.ts` | vm 沙盒、`mcp`/`__call_mcp__` → `callTool` |
-| `src/server/chat-mcp-tools.ts` | 多轮代码生成/重试、沙盒调用、最终流式 |
-| 仓库根 `.env.example` | `MCP_SERVERS`、`MCP_FILESYSTEM_ROOT`、`CHAT_MCP_*`、`CHAT_MCP_CODE_*` 等说明 |
+| `src/server/chat-mcp-tools.ts` | 多轮代码生成/重试、沙盒调用、最终流式；`inferMcpRouteByHeuristic`、路由 LLM |
+| 仓库根 `.env.example` | `MCP_SERVERS`、`MCP_FILESYSTEM_ROOT`、`CHAT_MCP_*`、`CHAT_MCP_CODE_*`、`CHAT_MCP_TURN_ROUTER`、`CHAT_MCP_ROUTER_HEURISTIC` 等说明 |
 
 ---
 
