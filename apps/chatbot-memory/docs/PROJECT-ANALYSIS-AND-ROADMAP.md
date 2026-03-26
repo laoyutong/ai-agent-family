@@ -11,7 +11,7 @@
 | 定位 | 浏览器端「知忆」：多会话、本地持久化、可选 MCP 工具 |
 | 技术栈 | TypeScript、Vite 6、Express 4、DeepSeek（OpenAI 兼容 API）、`@modelcontextprotocol/sdk` |
 | 记忆模型 | `turns`（近期逐轮）+ `summary` / `facts`（折叠后的长期层） |
-| MCP 集成 | 非原生 `tools` API：通过「生成代码 → `node:vm` 沙盒 → `callTool`」驱动 |
+| MCP 集成 | 非原生 `tools` API：「生成代码 → **子进程** `node:vm` → IPC → 父进程 `callTool`」驱动（可同进程回退） |
 
 ---
 
@@ -60,13 +60,14 @@
 
 ### 2.3 MCP 代码沙盒安全性
 
-实现使用 Node.js **`node:vm`**。官方文档指出 `vm` **不是** 安全隔离边界；模型生成的代码理论上可能通过原型链等方式尝试逃逸（例如借助 `Object` 链访问危险能力）。
+**已实现（默认路径）：** 每次执行 **`child_process.fork`** 启动 **`mcp-sandbox-child.ts`**，在子进程中使用 **`node:vm`**；`mcp` / `__call_mcp__` 经 **IPC** 由父进程调用 **`McpPool.callTool`**。子进程环境会 **剔除** `DEEPSEEK_*`、`MCP_SERVERS`、常见 `*_API_KEY` 等敏感变量（见 `mcp-code-sandbox.ts` 与 `docs/MCP-CLIENT.md` §7）。**`CHAT_MCP_SANDBOX_IN_PROCESS=true`** 可退回同进程 vm（仅调试用）。
 
-**优化方向：**
+**残余风险：** `vm` 仍 **不是** 完备安全边界；子进程内若发生逃逸，攻击者可能控制 **该子进程**（仍可滥用本机资源、经由已启动的 MCP 子进程读盘等）。父进程内的 API 密钥与原始 `MCP_SERVERS` 不再直接暴露给沙盒 JS。
 
-- 评估 **`isolated-vm`**、**`vm2`**（若维护状态可接受）或 **Worker + 受限环境** 等更强隔离方案。
-- 对暴露给沙盒的全局做更严格的冻结与代理封装。
-- 在文档中明确「当前威胁模型」：仅信任模型输出时的风险与部署建议。
+**可选后续：**
+
+- 部署层叠加 **独立 UID / 容器 / cgroups**；或评估 **`isolated-vm`**（需与本机 Node 版本兼容）等。
+- 对暴露给 vm 的全局做更严格的冻结与代理封装（同进程回退路径下更有意义）。
 
 ---
 
@@ -181,7 +182,7 @@
 |--------|------|------|------|
 | P0 | LLM 调用扇出并行化 / 路由本地化 | 优化 | **已实现**（§2.1）；进一步可做 SSE 进度（§3.4） |
 | P0 | MCP 执行进度反馈（SSE + UI） | 新功能 | MCP 路径等待长，体验提升明显 |
-| P1 | 沙盒安全加固 | 优化 | 对齐威胁模型，减少逃逸风险 |
+| P1 | 沙盒安全加固 | 优化 | **子进程 + 环境剥离已 landing**；部署级隔离 / `isolated-vm` 仍为可选 |
 | P1 | 折叠失败数据恢复与重试 | 优化 | 避免「移出 turns 却未写入摘要」的静默丢失 |
 | P1 | 跨会话知识 / 用户级 Profile | 新功能 | **用户级事实已提供**（§3.1）；图谱化仍为后续 |
 | P2 | 会话持久化分文件或 SQLite | 优化 | **分文件已实现**（§2.2）；SQLite 仍为可选 |
@@ -199,7 +200,8 @@
 | `src/server/chatbot.ts` | 主对话流：熵过滤、MCP 分支、写入 `turns`、入队折叠 |
 | `src/server/chat-mcp-tools.ts` | MCP 路由、Plan-Execute / 单段代码、`runMcpSandboxCodegenLoop`、最终流式 |
 | `src/server/mcp-plan-execute.ts` | 多步 json 规划、对话/工具摘要、`parseMcpPlanFromModelText` |
-| `src/server/mcp-code-sandbox.ts` | `vm` 沙盒与 `callTool` 转发 |
+| `src/server/mcp-code-sandbox.ts` | fork、IPC、敏感 env 剥离；可选同进程 vm |
+| `src/server/mcp-sandbox-child.ts` | 子进程内 `vm` 执行模型代码 |
 | `src/server/session-store.ts` | 默认按会话分文件 + manifest；可选单文件路径 |
 | `src/server/user-facts-store.ts` | 用户级事实持久化 |
 | `src/server/user-facts-promote.ts` | 折叠后会话 facts → 用户库的合并 / 可选 LLM 筛选 |
@@ -215,3 +217,4 @@
 |------|------|
 | 2025-03-25 | 初版：基于仓库实现的分析与路线图整理 |
 | 2025-03-26 | 同步实现：§2.1 LLM 扇出；§2.2 分文件持久化；§3.1 用户级事实；§3.3 MCP Plan-Execute 编排（`mcp-plan-execute.ts`）。文档：`MCP-CLIENT.md` §4.2/§6.1；`.env.example`：`CHAT_MCP_PLAN_*` |
+| 2025-03-26 | §2.3：MCP 沙箱改为默认 **fork 子进程**（`mcp-sandbox-child.ts`）+ 剥离子进程敏感 env；`CHAT_MCP_SANDBOX_IN_PROCESS`。`MCP-CLIENT.md` §1/§4/§7；`.env.example` |

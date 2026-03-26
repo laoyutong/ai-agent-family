@@ -32,7 +32,7 @@
 
 - **MCP Client**：Node 进程内的 `Client` 实例（每个已连接的服务器一个），负责协议层的 `listTools`、`callTool`。
 - **McpPool**：对多个 `Client` 的薄封装，用配置里的 `id` 区分「连到哪台 MCP」，供聊天与 HTTP 共用。
-- **大模型**：不直接连 MCP；通过 **在 system 中注入 `mcp` 门面说明**，让模型输出 **fenced 代码块**；服务端在 **`node:vm` 沙盒** 中执行代码，将 `mcp.xxx` / `__call_mcp__` 转发为 **`McpPool.callTool`**。
+- **大模型**：不直接连 MCP；通过 **在 system 中注入 `mcp` 门面说明**，让模型输出 **fenced 代码块**；默认由父进程 **`fork` 子进程**（`mcp-sandbox-child.ts` / `CHAT_MCP_SANDBOX_CHILD=1`）在隔离环境中用 **`node:vm`** 执行代码；`mcp.xxx` / `__call_mcp__` 经 **IPC** 由父进程映射为 **`McpPool.callTool`**。子进程继承的环境变量会 **剔除** `DEEPSEEK_*`、`MCP_SERVERS`、常见 `*_API_KEY` 等敏感键；详见 §7。
 - **执行**：模型生成的代码在沙盒内运行；每次「工具调用」由拦截层映射到真实 MCP，**不再**使用 DeepSeek 的 `tools` / `tool_calls`。
 
 ---
@@ -126,7 +126,7 @@
    - 模型输出须含 **一个** `javascript` / `typescript` fenced 代码块；解析后交给 `mcp-code-sandbox.ts`。
    - 若未找到代码块或沙盒执行未成功（且未超过**当前路径**下的轮次上限），在同一段 `messages` 中追加 **assistant + user（执行结果 + 重试说明）**，再请求模型**仅**输出修正后的代码块。
    - 若沙盒执行成功（`ok: true`），单段路径进入最终答复轮；多步路径则进入下一步或合并终答。
-7. **沙盒执行**（`mcp-code-sandbox.ts`）：`node:vm` 受限上下文，仅暴露 `mcp`、`__call_mcp__`、受限 `console` 与安全内置对象；`Promise.race` 控制**总执行时长**（`CHAT_MCP_CODE_MAX_MS`）；**每一次 vm 运行**内 MCP 调用次数上限见 `CHAT_MCP_CODE_MAX_CALLS`（多步时**每一步**单独进沙盒，计数**每步重置**）。
+7. **沙盒执行**（`mcp-code-sandbox.ts` + `mcp-sandbox-child.ts`）：默认 **每次执行 fork 一个子进程**，在子进程内创建 **`node:vm` 受限上下文**（仅暴露 `mcp`、`__call_mcp__`、受限 `console` 与安全内置）；MCP 实际调用在 **父进程** 完成并通过 IPC 回传。父进程侧 **`Promise` + 定时器** 控制**总执行时长**（`CHAT_MCP_CODE_MAX_MS`）；**每一次**子进程 vm 运行内 MCP 调用次数上限见 `CHAT_MCP_CODE_MAX_CALLS`（多步时**每一步**单独 fork，计数**每步重置**）。若设置 `CHAT_MCP_SANDBOX_IN_PROCESS=true`，则退回**同进程** vm（仅调试用，见 §7）。
 8. **最终答复轮**：流式 `chat/completions`；单段路径下会先 **`prepareMessagesForFinalReply`**，把「含代码的 assistant」换成占位说明，避免终答复述代码。将增量正文 **yield** 给前端。
 
 **分工**：**规划**与**每步代码**均由 **模型** 产出；是否在沙盒里执行、步骤间如何拼「观测」字符串、如何转发 MCP —— **本服务**。
@@ -141,8 +141,8 @@
   → 组装 messages（记忆 + 熵过滤结果）
   → （可选）MCP 启发式 / 路由 LLM 决定是否走沙盒
   → 若走 MCP：生成 mcp 门面文本 + system 说明（非 tools API）
-  → （可选）非流式：先产出 json 步骤计划 → 按步重复：非流式 fenced 代码 → vm 沙盒 → callTool；步间附带「此前观测」
-  → 或未规划：单段任务下非流式 fenced 代码 → vm 沙盒 → callTool
+  → （可选）非流式：先产出 json 步骤计划 → 按步重复：非流式 fenced 代码 → 子进程 vm 沙盒 →（IPC）父进程 callTool；步间附带「此前观测」
+  → 或未规划：单段任务下非流式 fenced 代码 → 子进程 vm 沙盒 →（IPC）父进程 callTool
   → 必要时多轮「无代码 / 执行失败 → 重试仅输出代码块」（单段/分步各自有上限）
   → 流式：模型根据【代码执行结果】产出最终 assistant 正文
   → 写入 session.turns，摘要/裁切逻辑照旧
@@ -159,7 +159,8 @@
 | `src/server/chatbot.ts` | 判断是否走 `streamChatWithMcpTools` |
 | `src/server/chat-mcp-limits.ts` | `CHAT_MCP_*` 体积与 `CHAT_MCP_CODE_*` 沙盒限额 |
 | `src/server/mcp-facade-prompt.ts` | JSON Schema → TS 占位、`mcp` 门面字符串、工具键映射 |
-| `src/server/mcp-code-sandbox.ts` | vm 沙盒、`mcp`/`__call_mcp__` → `callTool` |
+| `src/server/mcp-code-sandbox.ts` | fork 子进程、超时与 IPC；可选同进程回退 |
+| `src/server/mcp-sandbox-child.ts` | 子进程入口：`node:vm` 执行模型代码，经 IPC 请求父进程 `callTool` |
 | `src/server/chat-mcp-tools.ts` | Plan-Execute / 单段路径、`runMcpSandboxCodegenLoop`、最终流式；`inferMcpRouteByHeuristic`、路由 LLM |
 | `src/server/mcp-plan-execute.ts` | MCP 多步规划提示词、工具/对话摘要、`parseMcpPlanFromModelText` |
 | 仓库根 `.env.example` | `MCP_SERVERS`、`MCP_FILESYSTEM_ROOT`、`CHAT_MCP_*`、`CHAT_MCP_CODE_*`、`CHAT_MCP_PLAN_*`、`CHAT_MCP_TURN_ROUTER`、`CHAT_MCP_ROUTER_HEURISTIC` 等说明 |
@@ -181,6 +182,7 @@
 
 - MCP 协议交互依赖 **`@modelcontextprotocol/sdk`** 中的 `Client`、`StdioClientTransport`、`StreamableHTTPClientTransport`。
 - 大模型侧：MCP 路径使用 **`messages` + 非流式/流式** `chat/completions`；**不再**对 MCP 使用 `tools` / `tool_choice`。
-- 沙盒使用 Node 内置 **`node:vm`**（非进程级强隔离，生产环境若需更强隔离可再评估子进程或 `isolated-vm` 等方案）。
+- **默认**：模型生成的代码在 **子进程** 内通过 **`node:vm`** 运行（进程级隔离主服务与 API 密钥）；子进程内 **仍可能发生 vm 层逃逸**（例如通过 `AsyncFunction` 等），但逃逸影响范围主要为 **该子进程**；MCP 与密钥仍在父进程。若需更强隔离（独立 UID、容器、`isolated-vm` 等），可在部署层叠加。
+- **`CHAT_MCP_SANDBOX_IN_PROCESS=true`**：在同一 Node 进程内执行 vm（**不推荐**），便于本机调试；vm 逃逸将影响**整个服务进程**。
 
 （文档随当前代码结构编写；若你改动路由或环境变量名，请同步更新本节与 `.env.example`。）
