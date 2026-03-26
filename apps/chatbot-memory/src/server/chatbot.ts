@@ -15,6 +15,8 @@ import {
 import { buildSystemContent } from "./system-content.js";
 import type { McpPool } from "./mcp.js";
 import type { SessionStore } from "./session-store.js";
+import { createAfterFoldUserFactsPromotion } from "./user-facts-promote.js";
+import type { UserFactsStore } from "./user-facts-store.js";
 import { readUtf8Lines } from "../shared/stream-read.js";
 
 const fallbackSessions = new Map<string, SessionMemory>();
@@ -30,6 +32,8 @@ export type MemoryChatbotOptions = {
   mcp?: McpPool;
   /** 传入则多会话持久化到本地文件；不传则仅内存 Map（与旧行为一致） */
   sessionStore?: SessionStore;
+  /** 传入则注入跨会话用户级事实，并在记忆折叠后自动合并新要点（见环境变量 CHAT_USER_FACTS_*） */
+  userFactsStore?: UserFactsStore;
 };
 
 /**
@@ -39,6 +43,7 @@ export type MemoryChatbotOptions = {
 export function createMemoryChatbot(options?: MemoryChatbotOptions) {
   const mcpPool = options?.mcp;
   const sessionStore = options?.sessionStore;
+  const userFactsStore = options?.userFactsStore;
   const apiKey = options?.apiKey ?? process.env.DEEPSEEK_API_KEY;
   const baseURL = options?.baseURL ?? process.env.DEEPSEEK_BASE_URL ?? "https://api.deepseek.com";
   const model = options?.model ?? process.env.DEEPSEEK_MODEL ?? "deepseek-chat";
@@ -55,8 +60,22 @@ export function createMemoryChatbot(options?: MemoryChatbotOptions) {
     defaultModel: model,
   });
   const { foldDroppedIntoLayers } = createMemoryFold(completeNonStreaming);
+  const promoteUserFactsWithLlm = userFactsStore
+    ? parseEnvBool("CHAT_USER_FACTS_PROMOTE_LLM", false)
+    : false;
+  const promoteUserFactsModel =
+    process.env.CHAT_USER_FACTS_PROMOTE_MODEL?.trim() || model;
+
   const enqueueFold = createEnqueueFold(foldDroppedIntoLayers, behavior.summarizeOnTrim, {
     onFoldSettled: sessionStore ? (id) => sessionStore.onFoldSettled(id) : undefined,
+    onAfterFold:
+      userFactsStore &&
+      createAfterFoldUserFactsPromotion({
+        userFactsStore,
+        completeNonStreaming,
+        promoteWithLlm: promoteUserFactsWithLlm,
+        promoteModel: promoteUserFactsModel,
+      }),
   });
 
   function getSession(sessionId: string): SessionMemory {
@@ -84,7 +103,7 @@ export function createMemoryChatbot(options?: MemoryChatbotOptions) {
     const session = getSession(sessionId);
     const wasEmptyBeforeTurn = session.turns.length === 0;
 
-    const systemContent = buildSystemContent(session, systemPrompt);
+    const systemContent = buildSystemContent(session, systemPrompt, userFactsStore?.getFacts());
     let turnsForApi = session.turns;
     let userContentForApi = input;
 

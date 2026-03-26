@@ -1,7 +1,9 @@
 import express from "express";
+import { parseIntEnv } from "./chat-env.js";
 import { createMemoryChatbot } from "./chatbot.js";
 import { createDisabledMcpPool, createMcpPool, type McpPool } from "./mcp.js";
 import { createSessionStore, type SessionStore } from "./session-store.js";
+import { createUserFactsStore, UserFactsStore } from "./user-facts-store.js";
 
 export type ApiAppResult = {
   app: express.Application;
@@ -25,7 +27,12 @@ export async function createApiApp(): Promise<ApiAppResult> {
   }
 
   const sessionStore: SessionStore = await createSessionStore();
-  const bot = createMemoryChatbot({ mcp, sessionStore });
+  const userFactsMaxLines = parseIntEnv("CHAT_USER_FACTS_MAX_LINES", 200);
+  const userFactsStore = await createUserFactsStore(
+    UserFactsStore.defaultPath(),
+    userFactsMaxLines,
+  );
+  const bot = createMemoryChatbot({ mcp, sessionStore, userFactsStore });
 
   const app = express();
   app.use(express.json({ limit: "1mb" }));
@@ -122,6 +129,25 @@ export async function createApiApp(): Promise<ApiAppResult> {
     res.json({ ok: true });
   });
 
+  app.get("/api/user-facts", (_req, res) => {
+    res.json({ facts: userFactsStore.getFacts() });
+  });
+
+  app.patch("/api/user-facts", (req, res) => {
+    const facts = typeof req.body?.facts === "string" ? req.body.facts : undefined;
+    if (facts === undefined) {
+      res.status(400).json({ error: "需要字符串字段 facts" });
+      return;
+    }
+    userFactsStore.setFacts(facts);
+    res.json({ ok: true, facts: userFactsStore.getFacts() });
+  });
+
+  app.delete("/api/user-facts", (_req, res) => {
+    userFactsStore.clear();
+    res.json({ ok: true });
+  });
+
   app.get("/api/sessions", (_req, res) => {
     res.json({ sessions: sessionStore.listSessions() });
   });
@@ -182,6 +208,7 @@ export async function createApiApp(): Promise<ApiAppResult> {
     app,
     shutdown: async () => {
       await sessionStore.flushPending();
+      await userFactsStore.flushPending();
       await mcp.close();
     },
   };

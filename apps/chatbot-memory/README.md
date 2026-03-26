@@ -42,6 +42,9 @@ pnpm start
 | GET | `/api/sessions/:sessionId` | 返回该会话的 `turns`、`summary`、`facts`、`title`、`updatedAt` |
 | PATCH | `/api/sessions/:sessionId` | Body: `{ "title": "..." }` 重命名 |
 | DELETE | `/api/sessions/:sessionId` | 删除整个会话 |
+| GET | `/api/user-facts` | 用户级长期事实（跨会话）：`{ "facts": "每行一条\n..." }` |
+| PATCH | `/api/user-facts` | Body: `{ "facts": "..." }` 整体替换并持久化 |
+| DELETE | `/api/user-facts` | 清空用户级事实（不影响各会话条目） |
 
 ## 环境变量
 
@@ -51,6 +54,10 @@ pnpm start
 |------|------|
 | `PORT` | 开发默认 `5173`；生产 `pnpm start` 默认 `3001` |
 | `CHAT_SESSION_STORE_PATH` | 会话存储路径：未设置时默认为目录 `~/.chatbot-memory/sessions/`（每会话一个 `<uuid>.json`，另有 `manifest.json` 索引；仅变更的会话会重写）。若路径以 `.json` 结尾则使用旧版**单文件**全量写入（兼容已有部署） |
+| `CHAT_USER_FACTS_PATH` | 用户级事实 JSON 路径；默认 `~/.chatbot-memory/user-facts.json` |
+| `CHAT_USER_FACTS_MAX_LINES` | 用户级事实最多保留行数（默认 `200`，超出保留末尾） |
+| `CHAT_USER_FACTS_PROMOTE_LLM` | 记忆折叠后是否再调模型筛出「可跨会话」要点写入用户级事实（默认 `false`，仅合并本会话 facts 新增行） |
+| `CHAT_USER_FACTS_PROMOTE_MODEL` | 上述筛选所用模型；未设置则用主对话 `DEEPSEEK_MODEL` |
 
 ## 文档
 

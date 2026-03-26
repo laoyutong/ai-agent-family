@@ -92,6 +92,16 @@ export function createEnqueueFold(
   options?: {
     /** 单次折叠 promise 结束后调用（如写入会话持久化） */
     onFoldSettled?: (sessionId: string) => void;
+    /**
+     * 折叠成功并写回 `session.summary` / `session.facts` 之后调用（如同步到用户级事实库）。
+     * `previousSummary` / `previousFacts` 为折叠前的会话层快照。
+     */
+    onAfterFold?: (params: {
+      sessionId?: string;
+      session: SessionMemory;
+      previousSummary: string | undefined;
+      previousFacts: string | undefined;
+    }) => void | Promise<void>;
   },
 ): (
   session: SessionMemory,
@@ -111,6 +121,8 @@ export function createEnqueueFold(
 
     session.foldChain = (session.foldChain ?? Promise.resolve())
       .then(async () => {
+        const previousSummary = session.summary;
+        const previousFacts = session.facts;
         try {
           const { summary, facts } = await foldDroppedIntoLayers(
             session.summary,
@@ -119,6 +131,16 @@ export function createEnqueueFold(
           );
           session.summary = summary.trim() || undefined;
           session.facts = facts.trim() || undefined;
+          try {
+            await options?.onAfterFold?.({
+              sessionId,
+              session,
+              previousSummary,
+              previousFacts,
+            });
+          } catch (hookErr) {
+            console.error("[memory-fold] onAfterFold 失败:", hookErr);
+          }
         } catch (e) {
           console.error(
             mode === "incremental" ? "incremental summary fold failed:" : "chat history summarize failed:",

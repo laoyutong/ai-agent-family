@@ -100,11 +100,11 @@
 
 | 项目 | 说明 |
 |------|------|
-| **复杂度** | 高 |
+| **复杂度** | 高（图谱）；**用户级事实**已落地为基础版 |
 | **价值** | 高 |
-| **现状** | `facts` / `summary` 绑定单会话，无法在会话 B 复用会话 A 中用户声明的偏好。 |
-| **思路** | 引入全局 `UserProfile` 或「用户级事实」存储；折叠完成后将可跨会话复用的条目提升；`buildSystemContent` 注入全局层；需 **冲突与过期策略**。 |
-| **涉及** | `memory-fold.ts`、`system-content.ts`、`session-store.ts`（或新存储）、`chat-types.ts` |
+| **现状（已实现）** | `user-facts-store.ts`：`~/.chatbot-memory/user-facts.json`（或 `CHAT_USER_FACTS_PATH`）；`buildSystemContent` 注入 **【用户级长期要点】**；记忆折叠成功后把本会话 `facts` **相对折叠前**的新增行合并进用户库（整行去重、行数上限）。可选 `CHAT_USER_FACTS_PROMOTE_LLM` 用单次非流式调用筛「跨会话适用」子集。REST：`GET/PATCH/DELETE /api/user-facts`。 |
+| **仍可扩展** | 知识图谱、显式冲突解决、按时间衰减、与账号体系绑定等。 |
+| **涉及** | `user-facts-store.ts`、`user-facts-promote.ts`、`system-content.ts`、`memory-fold.ts`（`onAfterFold`）、`chatbot.ts`、`app.ts` |
 
 ---
 
@@ -183,7 +183,7 @@
 | P0 | MCP 执行进度反馈（SSE + UI） | 新功能 | MCP 路径等待长，体验提升明显 |
 | P1 | 沙盒安全加固 | 优化 | 对齐威胁模型，减少逃逸风险 |
 | P1 | 折叠失败数据恢复与重试 | 优化 | 避免「移出 turns 却未写入摘要」的静默丢失 |
-| P1 | 跨会话知识 / 用户级 Profile | 新功能 | 与「记忆型」产品定位强相关 |
+| P1 | 跨会话知识 / 用户级 Profile | 新功能 | **用户级事实已提供**（§3.1）；图谱化仍为后续 |
 | P2 | 会话持久化分文件或 SQLite | 优化 | **分文件已实现**（§2.2）；SQLite 仍为可选 |
 | P2 | 前端流式渲染节流 / 虚拟列表 | 优化 | 长会话性能与流畅度 |
 | P2 | 多模型路由 | 新功能 | 扩展性强，利于多后端 |
@@ -200,6 +200,8 @@
 | `src/server/chat-mcp-tools.ts` | MCP 路由、代码轮次、最终流式 |
 | `src/server/mcp-code-sandbox.ts` | `vm` 沙盒与 `callTool` 转发 |
 | `src/server/session-store.ts` | 默认按会话分文件 + manifest；可选单文件路径 |
+| `src/server/user-facts-store.ts` | 用户级事实持久化 |
+| `src/server/user-facts-promote.ts` | 折叠后会话 facts → 用户库的合并 / 可选 LLM 筛选 |
 | `src/server/memory-fold.ts` | 摘要 / 要点折叠与 `foldChain` |
 | `src/client/main.ts` | 会话 UI、SSE 消费、Markdown 渲染 |
 | `docs/MCP-CLIENT.md` | MCP 客户端说明（若与「始终走 MCP」等行为不一致，请以代码为准并考虑同步文档） |
@@ -211,4 +213,4 @@
 | 日期 | 说明 |
 |------|------|
 | 2025-03-25 | 初版：基于仓库实现的分析与路线图整理 |
-| 2025-03-26 | 同步实现状态：§2.1 熵过滤与 listTools 并行、MCP 路由启发式；§2.2 分文件持久化与旧库迁移 |
+| 2025-03-26 | 同步实现：§2.1 LLM 扇出优化；§2.2 分文件持久化；§3.1 用户级事实（存储、system 注入、折叠合并、REST） |
