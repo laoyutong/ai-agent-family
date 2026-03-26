@@ -14,6 +14,8 @@ pnpm install
 
 API 密钥（当前为 **DeepSeek**）统一放在仓库根目录：复制 `.env.example` 为 `.env` 并填写 `DEEPSEEK_API_KEY`（`.env` 已列入 `.gitignore`，勿提交）。
 
+提交信息约定见根目录 [CONTRIBUTING.md](./CONTRIBUTING.md)（Conventional Commits 风格；勿附 `Made-with:` 等工具脚注）。
+
 ## 常用命令
 
 | 命令 | 说明 |
