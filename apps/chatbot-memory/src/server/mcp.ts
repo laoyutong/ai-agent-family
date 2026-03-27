@@ -4,7 +4,12 @@ import { Client } from "@modelcontextprotocol/sdk/client";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 
+import { stringifyUnknownForLog } from "./log-preview.js";
+
 const CLIENT = { name: "chatbot-memory", version: "0.0.0" };
+
+/** MCP callTool 返回写入日志时的最大字符数（超长省略） */
+const MCP_CALL_TOOL_RESULT_LOG_MAX = 8_000;
 
 /** 统一 MCP 服务侧日志前缀，便于 grep `[MCP]` 看完整流程 */
 function mcpLog(phase: string, detail: Record<string, unknown> = {}) {
@@ -93,7 +98,7 @@ function describeCfg(cfg: McpCfg): Record<string, unknown> {
     return {
       transport: "stdio",
       command: cfg.command,
-      argsPreview: argLine.length > 400 ? `${argLine.slice(0, 400)}…` : argLine || undefined,
+      argsPreview: argLine || undefined,
       cwd: cfg.cwd,
       hasEnv: !!cfg.env,
       envKeys: cfg.env ? Object.keys(cfg.env).length : 0,
@@ -174,7 +179,7 @@ export async function createMcpPool(): Promise<McpPool> {
       if (instructions?.trim()) {
         mcpLog("connect:instructions", {
           id: cfg.id,
-          preview: instructions.length > 200 ? `${instructions.slice(0, 200)}…` : instructions,
+          preview: instructions,
         });
       }
       entries.push({ id: cfg.id, client });
@@ -266,7 +271,20 @@ export async function createMcpPool(): Promise<McpPool> {
         const ms = Math.round(performance.now() - t0);
         const err =
           result && typeof result === "object" && "isError" in result && result.isError === true;
-        mcpLog("callTool:done", { serverId, name, ms, isError: err });
+        let rawLen = 0;
+        try {
+          rawLen = JSON.stringify(result).length;
+        } catch {
+          rawLen = -1;
+        }
+        mcpLog("callTool:done", {
+          serverId,
+          name,
+          ms,
+          isError: err,
+          resultApproxChars: rawLen,
+          resultPreview: stringifyUnknownForLog(result, MCP_CALL_TOOL_RESULT_LOG_MAX),
+        });
         return result;
       } catch (err) {
         mcpLog("callTool:fail", {

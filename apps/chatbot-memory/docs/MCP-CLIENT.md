@@ -112,7 +112,7 @@
 
 ### 4.2 `streamChatWithMcpTools` 在做什么
 
-1. **体积控制**：按环境变量限制工具数量、单工具 schema、工具返回长度、整段 `messages` JSON 等，避免 413（见 `loadChatMcpPayloadLimits`，定义于 `chat-mcp-limits.ts`）；必要时**裁减** `listTools()` 子集并缩小生成的 `mcp` 门面文本。
+1. **体积控制**：当前 `loadChatMcpPayloadLimits` 对工具条数、schema、门面与上下文 JSON **不设上限**（依赖上游 API 自身限制）；若出现 413 需在应用外或后续再加回预算逻辑。
 2. **门面生成**（`mcp-facade-prompt.ts`）：把 `listTools()` 的 `inputSchema` 转成简化的 TypeScript 式参数类型，生成 `declare function __call_mcp__(…)` 与 `export const mcp = { … }` 说明文本；维护 Map：**工具键 → (serverId, MCP toolName)**，与沙盒内注入的 `mcp` 方法一致。
 3. **System 提示**：在首条 system 上追加【MCP 代码执行】说明与门面全文（若尚未包含【MCP 代码执行】标记）。
 4. **多步 Plan-Execute 编排（可选，默认开启）**（`mcp-plan-execute.ts` + `runMcpSandboxCodegenLoop`）：

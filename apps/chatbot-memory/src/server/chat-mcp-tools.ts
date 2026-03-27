@@ -12,10 +12,13 @@ import {
   plannerSystemPrompt,
   type McpPlan,
 } from "./mcp-plan-execute.js";
-import { clipText } from "../shared/text.js";
 import { readUtf8Lines } from "../shared/stream-read.js";
+import { truncateForLog } from "./log-preview.js";
 
 export type { ChatMcpPayloadLimits };
+
+/** 沙盒执行结果写控制台日志时的最大字符数（发给模型的仍为全文） */
+const SANDBOX_EXEC_LOG_MAX_CHARS = 12_000;
 
 type ChatMessageForMcp =
   | { role: "system"; content: string }
@@ -43,18 +46,12 @@ function buildMcpRouterToolsHint(
   limits: ChatMcpPayloadLimits,
 ): string {
   const slice = listed.slice(0, limits.maxTools);
-  const lines: string[] = [];
-  let bytes = 0;
-  const maxBytes = 14_000;
-  for (const t of slice) {
-    const desc = clipText((t.description ?? "").trim(), 200);
-    const line = `- ${t.serverId}/${t.name}${desc ? `: ${desc}` : ""}`;
-    const b = Buffer.byteLength(line, "utf8") + 1;
-    if (bytes + b > maxBytes) break;
-    bytes += b;
-    lines.push(line);
-  }
-  return lines.join("\n");
+  return slice
+    .map((t) => {
+      const desc = (t.description ?? "").trim();
+      return `- ${t.serverId}/${t.name}${desc ? `: ${desc}` : ""}`;
+    })
+    .join("\n");
 }
 
 /**
@@ -128,7 +125,6 @@ export async function shouldUseMcpSandboxForTurn(options: {
 function formatExecutionResultForLlm(
   sandbox: Awaited<ReturnType<typeof runMcpSandboxCode>>,
   noCodeFallback: string | null,
-  maxChars: number,
 ): string {
   const parts: string[] = ["【代码执行结果】"];
   if (noCodeFallback) {
@@ -151,15 +147,16 @@ function formatExecutionResultForLlm(
     parts.push(sandbox.error ?? "unknown");
     parts.push(`(MCP 调用次数: ${sandbox.callCount})`);
   }
-  return clipText(parts.join("\n"), maxChars);
+  return parts.join("\n");
 }
 
 const MCP_CODE_SYSTEM_HINT = `
 【MCP 代码执行】当用户问题需要外部能力时，请根据下方 **mcp** API 说明编写可在服务端沙盒中运行的逻辑代码。
 - 运行时由服务端注入真实的 \`mcp\` 与 \`__call_mcp__\`；禁止使用 require、import、process、fs、fetch 及任何网络/文件访问。
 - 请在本回复中输出**恰好一个** fenced 代码块，语言标记为 \`javascript\` 或 \`typescript\`。
-- 代码块内为异步逻辑，可使用 \`await mcp.xxx(...)\` 或 \`await __call_mcp__(toolKey, args)\`；可写 \`async function main() { ... }\` 并在末尾 \`return await main();\`。
-- 不要编造不存在的工具键名；工具键名须与下方 \`mcp\` 对象中的键一致。
+- **调用 MCP 工具时必须写 \`await __call_mcp__(toolKey, args)\`**：\`toolKey\` 只能从门面里每一行 \`=> __call_mcp__("……", args)\` 中**第一个字符串参数原样复制**（含连字符 \`-\`、大小写一致）。**禁止**使用 \`await mcp.xxx(args)\` 点号形式：易把 \`-\` 误写成 \`_\`，运行会报 \`is not a function\`。
+- 若用括号访问，可写 \`await mcp["与门面完全相同的键字符串"](args)\`，键须逐字复制，**禁止**把 \`-\` 改成 \`_\`。
+- 可写 \`async function main() { ... }\` 并在末尾 \`return await main();\`。
 - 若使用 filesystem 类 MCP：路径须为**服务器工作区根目录**下的相对路径（例如 \`code\`、\`code/foo.txt\`），不要使用本机绝对路径或臆造根目录。
 `.trim();
 
@@ -211,7 +208,6 @@ async function runMcpSandboxCodegenLoop(
         nameToRef: ctx.nameToRef,
         maxMs: ctx.sandboxLimits.maxMs,
         maxCalls: ctx.sandboxLimits.maxCalls,
-        maxToolResultChars: ctx.limits.maxToolResultChars,
       });
       if (execPayload.ok) {
         lastSandboxCode = code;
@@ -227,12 +223,21 @@ async function runMcpSandboxCodegenLoop(
       };
     }
 
-    const execText = formatExecutionResultForLlm(execPayload, noCodeNote, ctx.limits.maxToolResultChars);
+    const execText = formatExecutionResultForLlm(execPayload, noCodeNote);
+    if (execPayload.ok) {
+      console.log(
+        `[MCP] sandbox:exec ${ctx.echoRoundTag} round=${round} ok=true calls=${execPayload.callCount}`,
+      );
+    } else {
+      const execLogText = truncateForLog(execText, SANDBOX_EXEC_LOG_MAX_CHARS);
+      console.log(
+        `[MCP] sandbox:exec ${ctx.echoRoundTag} round=${round} ok=false calls=${execPayload.callCount}\n${execLogText}`,
+      );
+    }
     messages.push({ role: "assistant", content: lastAssistant });
 
     if (code && execPayload.ok && lastSandboxCode) {
       messages.push({ role: "user", content: execText });
-      console.log(`[MCP] ${ctx.echoRoundTag} sandbox ok`, { round, callCount: execPayload.callCount });
       return { ok: true, lastSandboxCode, execText };
     }
 
@@ -404,7 +409,7 @@ export async function* streamChatWithMcpTools(options: {
           `目标：${step.goal}`,
           step.notes ? `备注：${step.notes}` : "",
           priorAgg ? `【此前步骤观测】\n${priorAgg}` : `【此前步骤观测】（无）`,
-          `请**仅**输出一个 \`javascript\` 或 \`typescript\` 的 fenced 代码块，完成**当前步骤**；可使用 mcp / __call_mcp__；返回值与 console 会写入后续「观测」。`,
+          `请**仅**输出一个 \`javascript\` 或 \`typescript\` 的 fenced 代码块，完成**当前步骤**；须用 \`await __call_mcp__(门面里对应工具的字符串键, args)\`，勿用 \`mcp.xxx\` 点号；返回值与 console 会写入后续「观测」。`,
         ]
           .filter(Boolean)
           .join("\n\n");
@@ -428,14 +433,7 @@ export async function* streamChatWithMcpTools(options: {
 
       lastSandboxCode = lastSandboxCodes[lastSandboxCodes.length - 1] ?? null;
 
-      const mergedMax = Math.min(
-        limits.maxToolResultChars * Math.max(4, plan.steps.length),
-        limits.maxContextJsonBytes / 2,
-      );
-      const mergedExec = clipText(
-        `【代码执行结果】\n${stepExecTexts.join("\n\n---\n\n")}`,
-        mergedMax,
-      );
+      const mergedExec = `【代码执行结果】\n${stepExecTexts.join("\n\n---\n\n")}`;
 
       streamMessages = trimMessagesForByteBudget(
         options.messages.map((m) => ({ ...m })),

@@ -28,9 +28,8 @@ type SessionManifest = {
   sessions: Record<string, { title: string; updatedAt: number }>;
 };
 
-function truncateTitle(s: string, max: number): string {
-  const t = s.trim().replace(/\s+/g, " ");
-  return t.length <= max ? t : `${t.slice(0, max - 1)}…`;
+function normalizeTitle(s: string): string {
+  return s.trim().replace(/\s+/g, " ");
 }
 
 function defaultLegacySessionsFile(): string {
@@ -348,7 +347,7 @@ export class SessionStore {
   setTitle(id: string, title: string): void {
     const meta = this.meta.get(id);
     if (!meta) return;
-    meta.title = truncateTitle(title, 80) || "新会话";
+    meta.title = normalizeTitle(title) || "新会话";
     meta.updatedAt = Date.now();
     this.markDirty(id);
     void this.enqueueSave();
@@ -362,7 +361,7 @@ export class SessionStore {
     if (!meta) return;
     meta.updatedAt = Date.now();
     if (wasEmptyBefore && meta.title === "新会话") {
-      meta.title = truncateTitle(userContent, 48);
+      meta.title = normalizeTitle(userContent);
     }
     this.markDirty(sessionId);
     void this.enqueueSave();

@@ -45,17 +45,16 @@ export function popIncrementalSummaryBatch(
  */
 export function trimTurnsIfOverLimit(
   session: SessionMemory,
-  limits: Pick<MemoryChatbotBehaviorConfig, "maxHistoryPairs" | "maxHistoryChars">,
+  limits: Pick<MemoryChatbotBehaviorConfig, "maxHistoryPairs">,
 ): ChatMessage[] {
   const { turns } = session;
   const dropped: ChatMessage[] = [];
-  const { maxHistoryPairs, maxHistoryChars } = limits;
+  const { maxHistoryPairs } = limits;
 
   while (turns.length >= 2) {
     const pairCount = turns.length / 2;
     const overPairs = maxHistoryPairs > 0 && pairCount > maxHistoryPairs;
-    const overChars = maxHistoryChars > 0 && totalTurnChars(turns) > maxHistoryChars;
-    if (!overPairs && !overChars) break;
+    if (!overPairs) break;
     dropped.push(turns.shift()!, turns.shift()!);
   }
 

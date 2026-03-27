@@ -15,12 +15,6 @@ export function trimMessagesForByteBudget<T extends ChatBudgetMessage>(messages:
     }
     m.splice(1, 1);
   }
-  if (size() > maxBytes && m.length >= 2 && m[0]?.role === "system") {
-    const u = m[1];
-    if (u?.role === "user" && typeof u.content === "string" && u.content.length > 8000) {
-      u.content = `${u.content.slice(0, 8000)}…\n[已截断：当前用户消息过长]`;
-    }
-  }
   return m;
 }
 

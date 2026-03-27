@@ -1,4 +1,3 @@
-import { clipText } from "../shared/text.js";
 import type { McpPool } from "./mcp.js";
 import type { ChatMcpPayloadLimits } from "./chat-mcp-limits.js";
 
@@ -35,37 +34,23 @@ function buildPlannerToolsHint(
   limits: ChatMcpPayloadLimits,
 ): string {
   const slice = listed.slice(0, limits.maxTools);
-  const lines: string[] = [];
-  let bytes = 0;
-  const maxBytes = 16_000;
-  for (const t of slice) {
-    const desc = clipText((t.description ?? "").trim(), 240);
-    const line = `- ${t.serverId}/${t.name}${desc ? `: ${desc}` : ""}`;
-    const b = Buffer.byteLength(line, "utf8") + 1;
-    if (bytes + b > maxBytes) break;
-    bytes += b;
-    lines.push(line);
-  }
-  return lines.join("\n");
+  return slice
+    .map((t) => {
+      const desc = (t.description ?? "").trim();
+      return `- ${t.serverId}/${t.name}${desc ? `: ${desc}` : ""}`;
+    })
+    .join("\n");
 }
 
 /** 选取近期对话片段，供规划器理解指代（如「那个文件」） */
-function buildPlannerDialogueExcerpt(
-  dialogue: ReadonlyArray<{ role: string; content: string }>,
-  maxChars: number,
-): string {
+function buildPlannerDialogueExcerpt(dialogue: ReadonlyArray<{ role: string; content: string }>): string {
   const tail = dialogue.slice(-6);
   const lines: string[] = [];
-  let bytes = 0;
   for (const m of tail) {
     if (m.role !== "user" && m.role !== "assistant") continue;
     const role = m.role === "user" ? "用户" : "助手";
-    const text = clipText(typeof m.content === "string" ? m.content : "", 1200);
-    const line = `${role}: ${text}`;
-    const b = Buffer.byteLength(line, "utf8") + 2;
-    if (bytes + b > maxChars) break;
-    bytes += b;
-    lines.push(line);
+    const text = typeof m.content === "string" ? m.content : "";
+    lines.push(`${role}: ${text}`);
   }
   return lines.join("\n\n");
 }
@@ -78,7 +63,7 @@ export function buildPlannerUserContent(options: {
   dialogue: ReadonlyArray<{ role: string; content: string }>;
 }): string {
   const tools = buildPlannerToolsHint(options.listed, options.limits);
-  const excerpt = buildPlannerDialogueExcerpt(options.dialogue, 6000);
+  const excerpt = buildPlannerDialogueExcerpt(options.dialogue);
   const parts = [
     `【当前用户问题】\n${options.userMessage}`,
     `【可用 MCP 工具】\n${tools}`,

@@ -70,7 +70,7 @@ async function handleMessage(msg: unknown): Promise<void> {
       }
     });
     const line = `[${level}] ${parts.join(" ")}`;
-    consoleLines.push(line.length > 4000 ? `${line.slice(0, 4000)}…` : line);
+    consoleLines.push(line);
   };
 
   const dispatch = async (toolKey: string, args: object): Promise<unknown> => {

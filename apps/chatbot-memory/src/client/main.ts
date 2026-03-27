@@ -77,9 +77,8 @@ let turnIndex = 0;
 
 type AppendKind = "welcome" | "system";
 
-function truncatePreview(s: string, max: number): string {
-  const t = s.trim().replace(/\s+/g, " ");
-  return t.length <= max ? t : `${t.slice(0, max - 1)}…`;
+function previewLabel(s: string): string {
+  return s.trim().replace(/\s+/g, " ");
 }
 
 function renderIntroNav(): void {
@@ -94,7 +93,7 @@ function addQuestionNavItem(n: number, text: string): void {
   const a = document.createElement("a");
   a.href = `#q-${n}`;
   a.className = "question-nav-item";
-  a.textContent = `${n}. ${truncatePreview(text, 52)}`;
+  a.textContent = `${n}. ${previewLabel(text)}`;
   a.title = text;
   questionListEl.appendChild(a);
 }
@@ -241,7 +240,7 @@ function renderSessionList(sessions: SessionMeta[]): void {
     const btn = document.createElement("button");
     btn.type = "button";
     btn.className = "session-item";
-    btn.textContent = truncatePreview(s.title, 40);
+    btn.textContent = previewLabel(s.title);
     btn.title = s.title;
     btn.addEventListener("click", () => {
       void switchToSession(s.id);

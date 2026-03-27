@@ -1,6 +1,5 @@
 import type { ChatMcpPayloadLimits } from "./chat-mcp-limits.js";
 import type { McpPool } from "./mcp.js";
-import { clipText } from "../shared/text.js";
 
 /** 与 OpenAI function.name 一致：唯一、可读、≤64，便于与历史逻辑对齐 */
 const MAX_OPENAI_FUNCTION_NAME_LEN = 64;
@@ -100,10 +99,6 @@ function jsonSchemaToTsLike(schema: unknown, maxBytes = 2048): string {
       for (const [k, v] of Object.entries(props as Record<string, unknown>)) {
         const opt = req.has(k) ? "" : "?";
         parts.push(`${JSON.stringify(k)}${opt}: ${walk(v, depth + 1)}`);
-        if (parts.length > 24) {
-          parts.push("...");
-          break;
-        }
       }
       return `{ ${parts.join("; ")} }`;
     }
@@ -128,14 +123,17 @@ export function buildMcpFacadeFromTools(
   list: Awaited<ReturnType<McpPool["listTools"]>>,
   limits: ChatMcpPayloadLimits,
 ): McpFacadeBuild {
-  let sliced = list.slice(0, limits.maxTools);
+  const sliced = list.slice(0, limits.maxTools);
   const nameToRef = new Map<string, { serverId: string; toolName: string }>();
 
   const buildText = (): string => {
     const keys = makeOpenAiToolNames(sliced.map((t) => ({ serverId: t.serverId, name: t.name })));
     nameToRef.clear();
     const lines: string[] = [
-      "/** 运行时由服务端注入；此处仅为类型与调用约定说明 */",
+      "/**",
+      " * 运行时由服务端注入；此处为类型与调用约定说明。",
+      " * 代码里请只用 await __call_mcp__(与各条目 => 右侧 __call_mcp__(\"…\", args) 的引号内字符串逐字相同, args)；勿写 mcp.xxx()；勿把键中 - 改成 _。",
+      " */",
       "declare function __call_mcp__(toolKey: string, args: object): Promise<unknown>;",
       "",
       "export const mcp = {",
@@ -144,15 +142,14 @@ export function buildMcpFacadeFromTools(
       const t = sliced[i]!;
       const key = keys[i]!;
       nameToRef.set(key, { serverId: t.serverId, toolName: t.name });
-      const rawDesc = (t.description ?? "").trim() || `MCP tool ${t.serverId}/${t.name}`;
-      const desc = clipText(rawDesc, limits.maxDescriptionChars);
+      const desc = ((t.description ?? "").trim() || `MCP tool ${t.serverId}/${t.name}`).replace(/\*\//g, "*\\/");
       const baseSchema =
         t.inputSchema && typeof t.inputSchema === "object"
           ? t.inputSchema
           : { type: "object", properties: {}, additionalProperties: true };
       const argsTs = jsonSchemaToTsLike(baseSchema, limits.maxParamBytesPerTool);
       const prop = escapePropertyName(key);
-      lines.push(`  /** ${desc.replace(/\*\//g, "*\\/")} */`);
+      lines.push(`  /** ${desc} */`);
       lines.push(
         `  ${prop}: async (args: ${argsTs}): Promise<unknown> => __call_mcp__(${JSON.stringify(key)}, args),`,
       );
@@ -161,21 +158,7 @@ export function buildMcpFacadeFromTools(
     return lines.join("\n");
   };
 
-  let facadeText = buildText();
-  let bytes = Buffer.byteLength(facadeText, "utf8");
-  while (bytes > limits.maxToolsJsonBytes && sliced.length > 1) {
-    sliced = sliced.slice(0, Math.max(1, Math.floor(sliced.length / 2)));
-    facadeText = buildText();
-    bytes = Buffer.byteLength(facadeText, "utf8");
-    console.warn(
-      `[MCP] mcp 门面约 ${bytes} bytes（目标 ≤${limits.maxToolsJsonBytes}），已缩减为前 ${sliced.length} 个工具`,
-    );
-  }
-  if (bytes > limits.maxToolsJsonBytes) {
-    console.warn(
-      `[MCP] mcp 门面仍约 ${bytes} bytes，若仍过大请降低 CHAT_MCP_MAX_TOOLS 或 CHAT_MCP_TOOL_PARAM_MAX_BYTES`,
-    );
-  }
+  const facadeText = buildText();
 
   return { facadeText, nameToRef };
 }

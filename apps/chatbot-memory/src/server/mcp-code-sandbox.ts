@@ -55,9 +55,7 @@ function resolveSandboxChildEntry(): { entry: string; execArgv: string[] } {
 
 /** 服务端日志：便于排查沙盒实际执行的代码（grep `[MCP] sandbox:code`） */
 export function logMcpSandboxCode(round: number, code: string): void {
-  const max = 24_000;
-  const body = code.length > max ? `${code.slice(0, max)}…` : code;
-  console.log(`[MCP] sandbox:code`, { round, chars: code.length, body });
+  console.log(`[MCP] sandbox:code`, { round, chars: code.length, body: code });
 }
 
 function cloneJsonSafe(x: unknown): unknown {
@@ -74,7 +72,6 @@ export type McpSandboxOptions = {
   nameToRef: Map<string, { serverId: string; toolName: string }>;
   maxMs: number;
   maxCalls: number;
-  maxToolResultChars: number;
 };
 
 export type McpSandboxResult = {
@@ -191,21 +188,7 @@ async function runMcpSandboxCodeInChildProcess(opts: McpSandboxOptions): Promise
           callCount += 1;
           const raw = await opts.mcp.callTool(ref.serverId, ref.toolName, args);
           const cloned = cloneJsonSafe(raw) as unknown;
-          const s = JSON.stringify(cloned);
-          if (s.length > opts.maxToolResultChars) {
-            child.send({
-              type: "mcpResult",
-              seq: m.seq,
-              ok: true,
-              result: {
-                _mcpTruncated: true,
-                _approxChars: s.length,
-                preview: s.slice(0, opts.maxToolResultChars),
-              },
-            });
-          } else {
-            child.send({ type: "mcpResult", seq: m.seq, ok: true, result: cloned });
-          }
+          child.send({ type: "mcpResult", seq: m.seq, ok: true, result: cloned });
         } catch (e) {
           child.send({
             type: "mcpResult",
@@ -242,10 +225,7 @@ async function runMcpSandboxCodeInChildProcess(opts: McpSandboxOptions): Promise
 
     child.on("exit", (code, signal) => {
       if (settled) return;
-      const hint =
-        stderrBuf.trim().length > 0
-          ? ` 子进程 stderr: ${stderrBuf.trim().slice(0, 500)}${stderrBuf.length > 500 ? "…" : ""}`
-          : "";
+      const hint = stderrBuf.trim().length > 0 ? ` 子进程 stderr: ${stderrBuf.trim()}` : "";
       finish({
         ok: false,
         error: signal
@@ -280,7 +260,7 @@ async function runMcpSandboxCodeInProcess(opts: McpSandboxOptions): Promise<McpS
       }
     });
     const line = `[${level}] ${parts.join(" ")}`;
-    consoleLines.push(line.length > 4000 ? `${line.slice(0, 4000)}…` : line);
+    consoleLines.push(line);
   };
 
   let callCount = 0;
@@ -295,16 +275,7 @@ async function runMcpSandboxCodeInProcess(opts: McpSandboxOptions): Promise<McpS
     }
     callCount += 1;
     const raw = await opts.mcp.callTool(ref.serverId, ref.toolName, args as Record<string, unknown>);
-    const cloned = cloneJsonSafe(raw) as unknown;
-    const s = JSON.stringify(cloned);
-    if (s.length > opts.maxToolResultChars) {
-      return {
-        _mcpTruncated: true,
-        _approxChars: s.length,
-        preview: s.slice(0, opts.maxToolResultChars),
-      };
-    }
-    return cloned;
+    return cloneJsonSafe(raw) as unknown;
   };
 
   const mcpObj: Record<string, (args: object) => Promise<unknown>> = {};

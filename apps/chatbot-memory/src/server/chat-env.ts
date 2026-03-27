@@ -18,7 +18,6 @@ export function parseEnvBool(name: string, defaultValue: boolean): boolean {
 /** 记忆、裁切、摘要、熵过滤等行为参数（均由环境变量驱动，带默认值） */
 export type MemoryChatbotBehaviorConfig = {
   maxHistoryPairs: number;
-  maxHistoryChars: number;
   summarizeOnTrim: boolean;
   incrementalSummaryEveryNPairs: number;
   entropyPerplexityFilter: boolean;
@@ -34,7 +33,6 @@ export function loadMemoryChatbotBehaviorConfig(
 ): MemoryChatbotBehaviorConfig {
   return {
     maxHistoryPairs: parseIntEnv("CHAT_HISTORY_MAX_PAIRS", 30),
-    maxHistoryChars: parseIntEnv("CHAT_HISTORY_MAX_CHARS", 0),
     summarizeOnTrim: parseEnvBool("CHAT_HISTORY_SUMMARIZE", true),
     incrementalSummaryEveryNPairs: parseIntEnv("CHAT_INCREMENTAL_SUMMARY_EVERY_N_PAIRS", 5),
     entropyPerplexityFilter: parseEnvBool("CHAT_CONTEXT_ENTROPY_PPL_FILTER", true),
