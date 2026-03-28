@@ -17,6 +17,7 @@ import type { McpPool } from "./mcp.js";
 import type { SessionStore } from "./session-store.js";
 import { createAfterFoldUserFactsPromotion } from "./user-facts-promote.js";
 import type { UserFactsStore } from "./user-facts-store.js";
+import type { ChatStreamPart } from "../shared/chat-stream.js";
 import { readUtf8Lines } from "../shared/stream-read.js";
 
 const fallbackSessions = new Map<string, SessionMemory>();
@@ -95,7 +96,7 @@ export function createMemoryChatbot(options?: MemoryChatbotOptions) {
    * → 若 MCP 有工具且路由判定需要外部能力则走 streamChatWithMcpTools（代码沙盒 + 最终流式），否则 DeepSeek 流式
    * → 写入 turns → 摘要/裁切队列。
    */
-  async function* streamChat(input: string, sessionId: string): AsyncGenerator<string> {
+  async function* streamChat(input: string, sessionId: string): AsyncGenerator<ChatStreamPart> {
     if (!apiKey) {
       throw new Error("未配置 DEEPSEEK_API_KEY");
     }
@@ -185,7 +186,7 @@ export function createMemoryChatbot(options?: MemoryChatbotOptions) {
               messages,
               toolsList: listed,
             })) {
-              assistantFull += chunk;
+              if (chunk.type === "text") assistantFull += chunk.text;
               yield chunk;
             }
             session.turns.push({ role: "user", content: input });
@@ -229,7 +230,7 @@ export function createMemoryChatbot(options?: MemoryChatbotOptions) {
       const text = parseSseDataLine(line);
       if (text) {
         assistantFull += text;
-        yield text;
+        yield { type: "text", text };
       }
     }
 
@@ -247,7 +248,7 @@ export function createMemoryChatbot(options?: MemoryChatbotOptions) {
   return {
     /** 按会话流式生成助手回复文本片段（AsyncGenerator） */
     stream: (input: string, sessionId: string) => streamChat(input, sessionId),
-    /** 清空指定会话的逐轮记忆与摘要层，保留会话 id（与侧栏条目） */
+    /** 清空指定会话的逐轮记忆与摘要层，保留会话 id；持久化时会话标题重置为「新会话」 */
     clearSession: (sessionId: string) => {
       if (sessionStore) {
         sessionStore.clearMemory(sessionId);

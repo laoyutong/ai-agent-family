@@ -305,7 +305,7 @@ export class SessionStore {
     return id;
   }
 
-  /** 仅清空轮次与分层记忆，保留会话条目与标题（用于「清空记忆」） */
+  /** 仅清空轮次与分层记忆，保留会话 id；标题恢复为「新会话」（用于「清空记忆」） */
   clearMemory(id: string): void {
     const m = this.memories.get(id);
     if (!m) return;
@@ -314,7 +314,10 @@ export class SessionStore {
     delete m.facts;
     m.foldChain = undefined;
     const meta = this.meta.get(id);
-    if (meta) meta.updatedAt = Date.now();
+    if (meta) {
+      meta.title = "新会话";
+      meta.updatedAt = Date.now();
+    }
     this.markDirty(id);
     void this.enqueueSave();
   }

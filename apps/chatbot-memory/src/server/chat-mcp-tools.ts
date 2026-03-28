@@ -12,6 +12,7 @@ import {
   plannerSystemPrompt,
   type McpPlan,
 } from "./mcp-plan-execute.js";
+import type { ChatStreamPart } from "../shared/chat-stream.js";
 import { readUtf8Lines } from "../shared/stream-read.js";
 import { truncateForLog } from "./log-preview.js";
 
@@ -175,18 +176,24 @@ type SandboxCodegenContext = {
   echoRoundTag: string;
 };
 
+type SandboxCodegenLoopResult =
+  | { ok: true; lastSandboxCode: string; execText: string }
+  | { ok: false };
+
 /**
  * 在已组好的 messages 上循环：非流式要代码 → 沙盒执行，成功则尾部为 assistant(含代码)+user(执行结果)。
+ * 通过 yield 推送阶段，便于前端区分「模型写代码」与「工具执行中」。
  */
-async function runMcpSandboxCodegenLoop(
+async function* runMcpSandboxCodegenLoop(
   messages: ChatMessageForMcp[],
   maxRounds: number,
   ctx: SandboxCodegenContext,
-): Promise<{ ok: true; lastSandboxCode: string; execText: string } | { ok: false }> {
+): AsyncGenerator<Extract<ChatStreamPart, { type: "phase" }>, SandboxCodegenLoopResult> {
   let lastAssistant = "";
   let lastSandboxCode: string | null = null;
   let round = 0;
   for (; round < maxRounds; round++) {
+    yield { type: "phase", phase: "mcp_codegen" };
     squeezeMessagesForByteBudget(messages, ctx.limits.maxContextJsonBytes);
     const { content } = await fetchChatCompletionNonStream({
       chatUrl: ctx.chatUrl,
@@ -202,6 +209,7 @@ async function runMcpSandboxCodegenLoop(
 
     if (code) {
       logMcpSandboxCode(round, code);
+      yield { type: "phase", phase: "mcp_tools" };
       execPayload = await runMcpSandboxCode({
         code,
         mcp: ctx.mcp,
@@ -250,6 +258,7 @@ async function runMcpSandboxCodegenLoop(
   return { ok: false };
 }
 
+
 async function fetchMcpExecutionPlan(options: {
   chatUrl: string;
   apiKey: string;
@@ -286,9 +295,14 @@ async function fetchMcpExecutionPlan(options: {
       console.warn(`[MCP] plan 步骤 ${plan.steps.length} 超出上限 ${cap}，已截断`);
       plan.steps = plan.steps.slice(0, cap);
     }
-    console.log(`[MCP] plan 解析成功`, { steps: plan.steps.length, ids: plan.steps.map((s) => s.id) });
+    console.log(
+      `[MCP] plan 解析成功 ${plan.steps.length} 步 id=[${plan.steps.map((s) => s.id).join(", ")}]`,
+    );
+    console.log("[MCP] plan 内容:\n" + JSON.stringify(plan, null, 2));
   } else {
-    console.warn(`[MCP] plan 解析失败，回退单段代码路径`);
+    console.warn(
+      `[MCP] plan 解析失败，回退单段代码路径\n[规划模型原文]\n${truncateForLog(text, SANDBOX_EXEC_LOG_MAX_CHARS)}`,
+    );
   }
   return plan;
 }
@@ -330,7 +344,7 @@ export async function* streamChatWithMcpTools(options: {
    * 若已由调用方执行过 `listTools()`，传入可避免重复请求 MCP（例如 chatbot 先拉列表判断非空）。
    */
   toolsList?: Awaited<ReturnType<McpPool["listTools"]>>;
-}): AsyncGenerator<string, string> {
+}): AsyncGenerator<ChatStreamPart, string> {
   const { mcp, chatBaseUrl, apiKey, model, temperature } = options;
   const limits = loadChatMcpPayloadLimits();
   const sandboxLimits = loadMcpCodeSandboxLimits();
@@ -386,6 +400,7 @@ export async function* streamChatWithMcpTools(options: {
 
   let usedPlan = false;
   if (planExecuteEnabled && list.length >= planMinTools && userMessageForPlan) {
+    yield { type: "phase", phase: "mcp_planning" };
     const plan = await fetchMcpExecutionPlan({
       chatUrl,
       apiKey,
@@ -419,10 +434,16 @@ export async function* streamChatWithMcpTools(options: {
         stepMessages.push({ role: "user", content: stepPrompt });
 
         const stepRounds = MAX_MCP_PLAN_STEP_CODE_ROUNDS();
-        const stepResult = await runMcpSandboxCodegenLoop(stepMessages, stepRounds, {
+        const stepGen = runMcpSandboxCodegenLoop(stepMessages, stepRounds, {
           ...codegenCtx,
           echoRoundTag: `plan ${si + 1}/${plan.steps.length}`,
         });
+        let stepIter = await stepGen.next();
+        while (!stepIter.done) {
+          yield stepIter.value;
+          stepIter = await stepGen.next();
+        }
+        const stepResult = stepIter.value;
         if (!stepResult.ok) {
           throw new Error(`MCP 多步编排：${stepLabel} 在 ${stepRounds} 轮内未成功执行`);
         }
@@ -453,7 +474,13 @@ export async function* streamChatWithMcpTools(options: {
   }
 
   if (!usedPlan) {
-    const singlePass = await runMcpSandboxCodegenLoop(messages, MAX_MCP_CODE_ROUNDS, codegenCtx);
+    const singleGen = runMcpSandboxCodegenLoop(messages, MAX_MCP_CODE_ROUNDS, codegenCtx);
+    let singleIter = await singleGen.next();
+    while (!singleIter.done) {
+      yield singleIter.value;
+      singleIter = await singleGen.next();
+    }
+    const singlePass = singleIter.value;
     if (!singlePass.ok) {
       throw new Error(`MCP 代码生成与执行超过 ${MAX_MCP_CODE_ROUNDS} 轮上限`);
     }
@@ -462,6 +489,8 @@ export async function* streamChatWithMcpTools(options: {
     streamMessages = messages;
     squeezeMessagesForByteBudget(streamMessages, limits.maxContextJsonBytes);
   }
+
+  yield { type: "phase", phase: "mcp_summarizing" };
 
   const res = await fetch(chatUrl, {
     method: "POST",
@@ -489,18 +518,18 @@ export async function* streamChatWithMcpTools(options: {
     );
     const codeBlock = `\n\n${parts.join("\n")}\n---\n\n`;
     assistantFull += codeBlock;
-    yield codeBlock;
+    yield { type: "text", text: codeBlock };
   } else if (echoCodeToUser && lastSandboxCode) {
     const codeBlock = `\n\n**[MCP 已执行代码]**\n\n\`\`\`javascript\n${lastSandboxCode}\n\`\`\`\n\n---\n\n`;
     assistantFull += codeBlock;
-    yield codeBlock;
+    yield { type: "text", text: codeBlock };
   }
 
   for await (const line of readUtf8Lines(res.body)) {
     const text = parseSseDataLine(line);
     if (text) {
       assistantFull += text;
-      yield text;
+      yield { type: "text", text };
     }
   }
   return assistantFull;

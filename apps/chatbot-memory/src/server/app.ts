@@ -109,8 +109,12 @@ export async function createApiApp(): Promise<ApiAppResult> {
 
     try {
       const stream = bot.stream(message, sessionId);
-      for await (const text of stream) {
-        if (text) sendSse({ text });
+      for await (const part of stream) {
+        if (part.type === "phase") {
+          sendSse({ phase: part.phase });
+        } else if (part.type === "text" && part.text) {
+          sendSse({ text: part.text });
+        }
       }
       sendSse({ done: true });
       res.end();

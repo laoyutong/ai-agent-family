@@ -352,8 +352,16 @@ body {
   background: linear-gradient(145deg, rgba(26, 31, 39, 0.98) 0%, rgba(20, 24, 31, 0.99) 100%);
 }
 
-.bubble.assistant.is-pending::after {
-  content: "正在生成…";
+.bubble.assistant.is-pending.is-mcp-busy {
+  border-color: rgba(138, 180, 248, 0.38);
+}
+
+.bubble.assistant.is-pending.is-tool-calling {
+  border-color: rgba(52, 168, 109, 0.42);
+  background: linear-gradient(145deg, rgba(22, 32, 28, 0.98) 0%, rgba(20, 26, 24, 0.99) 100%);
+}
+
+.bubble.assistant.is-pending .assistant-phase {
   font-size: 0.8125rem;
   color: var(--text-muted);
   letter-spacing: 0.02em;
@@ -371,7 +379,7 @@ body {
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .bubble.assistant.is-pending::after {
+  .bubble.assistant.is-pending .assistant-phase {
     animation: none;
     opacity: 0.72;
   }

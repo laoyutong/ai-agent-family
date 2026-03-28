@@ -1,5 +1,6 @@
 import "./style.css";
 import { renderMarkdown } from "./markdown.js";
+import { phaseLabel } from "../shared/chat-stream.js";
 import { readUtf8StreamChunks } from "../shared/stream-read.js";
 
 const app = document.querySelector<HTMLDivElement>("#app");
@@ -13,6 +14,9 @@ const LEGACY_SESSION_KEY = "chatbot-memory-session";
 
 const WELCOME_TEXT =
   "你好，我是 **知忆**——你的记忆型对话伙伴。我会记住对话中的偏好与事实，让交流更连贯。从任意话题开始都可以。";
+
+/** 非 MCP 流式：首包前的气泡提示 */
+const PENDING_COPY_DEFAULT = "正在生成…";
 
 type SessionMeta = { id: string; title: string; updatedAt: number };
 
@@ -160,15 +164,34 @@ function createAssistantBubble(): HTMLDivElement {
   const wrap = document.createElement("div");
   wrap.className = "bubble assistant markdown-body is-pending";
   wrap.setAttribute("aria-busy", "true");
-  wrap.innerHTML = "";
+  const phaseEl = document.createElement("span");
+  phaseEl.className = "assistant-phase";
+  phaseEl.setAttribute("aria-live", "polite");
+  phaseEl.textContent = PENDING_COPY_DEFAULT;
+  wrap.appendChild(phaseEl);
   wrap.id = `a-${turnIndex}`;
   chatEl.appendChild(wrap);
   chatEl.scrollTop = chatEl.scrollHeight;
   return wrap;
 }
 
+function setAssistantPhaseLine(el: HTMLDivElement, phase: string): void {
+  let line = el.querySelector<HTMLSpanElement>(".assistant-phase");
+  if (!line) {
+    line = document.createElement("span");
+    line.className = "assistant-phase";
+    line.setAttribute("aria-live", "polite");
+    el.insertBefore(line, el.firstChild);
+  }
+  line.textContent = phaseLabel(phase);
+  el.classList.add("is-pending");
+  el.setAttribute("aria-busy", "true");
+  el.classList.toggle("is-tool-calling", phase === "mcp_tools");
+  el.classList.toggle("is-mcp-busy", phase.startsWith("mcp_"));
+}
+
 function clearAssistantPending(el: HTMLDivElement): void {
-  el.classList.remove("is-pending");
+  el.classList.remove("is-pending", "is-tool-calling", "is-mcp-busy");
   el.removeAttribute("aria-busy");
 }
 
@@ -476,6 +499,10 @@ async function send(): Promise<void> {
           assistantEl.textContent = `错误：${ev.error}`;
           return;
         }
+        if (typeof ev.phase === "string" && ev.phase.length > 0) {
+          setAssistantPhaseLine(assistantEl, ev.phase);
+          scrollChat();
+        }
         if (typeof ev.text === "string" && ev.text) {
           assistantMd += ev.text;
           setAssistantMarkdown(assistantEl, assistantMd);
@@ -493,6 +520,9 @@ async function send(): Promise<void> {
         clearAssistantPending(assistantEl);
         assistantEl.textContent = `错误：${ev.error}`;
         return;
+      }
+      if (typeof ev.phase === "string" && ev.phase.length > 0) {
+        setAssistantPhaseLine(assistantEl, ev.phase);
       }
       if (typeof ev.text === "string" && ev.text) {
         assistantMd += ev.text;
