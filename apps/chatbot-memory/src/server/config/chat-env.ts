@@ -41,3 +41,46 @@ export function loadMemoryChatbotBehaviorConfig(
     entropyFilterModel: process.env.CHAT_CONTEXT_ENTROPY_PPL_MODEL?.trim() || defaultModel,
   };
 }
+
+/** `relevant`：按本轮用户输入与归档正文做 lexical 重合打分，只注入分最高的前 N 条 */
+export type FoldArchiveInjectSelectMode = "relevant" | "recent";
+
+/** lexical 全为 0 时：回退为按时间取最近几条，或本轮不注入归档 */
+export type FoldArchiveInjectRelevanceFallback = "recent" | "none";
+
+/** 将磁盘折叠归档节选写入每轮 system 的上限（见 `buildFoldArchiveInjectBlock`） */
+export type FoldArchiveInjectConfig = {
+  /** 是否把归档拼进模型 system（归档功能开启时默认可用；可用 `false` 关闭以省 token） */
+  enabled: boolean;
+  /** 最多包含几条归档批次（`relevant` 为分最高的前 N 条；`recent` 为从新到旧前 N 条） */
+  maxEntries: number;
+  /** 整段「归档节选」总字符上限 */
+  maxTotalChars: number;
+  /** 每条归档内「原文节选」字符上限 */
+  turnsMaxCharsPerEntry: number;
+  selectMode: FoldArchiveInjectSelectMode;
+  relevanceFallback: FoldArchiveInjectRelevanceFallback;
+};
+
+function parseFoldArchiveInjectSelectMode(): FoldArchiveInjectSelectMode {
+  const v = process.env.CHAT_FOLD_ARCHIVE_INJECT_SELECT?.trim().toLowerCase();
+  if (v === "recent" || v === "time" || v === "latest") return "recent";
+  return "relevant";
+}
+
+function parseFoldArchiveInjectRelevanceFallback(): FoldArchiveInjectRelevanceFallback {
+  const v = process.env.CHAT_FOLD_ARCHIVE_INJECT_RELEVANCE_FALLBACK?.trim().toLowerCase();
+  if (v === "none" || v === "off" || v === "empty") return "none";
+  return "recent";
+}
+
+export function loadFoldArchiveInjectConfig(): FoldArchiveInjectConfig {
+  return {
+    enabled: parseEnvBool("CHAT_FOLD_ARCHIVE_INJECT", true),
+    maxEntries: parseIntEnv("CHAT_FOLD_ARCHIVE_INJECT_MAX_ENTRIES", 6),
+    maxTotalChars: parseIntEnv("CHAT_FOLD_ARCHIVE_INJECT_MAX_CHARS", 12000),
+    turnsMaxCharsPerEntry: parseIntEnv("CHAT_FOLD_ARCHIVE_INJECT_TURNS_MAX_CHARS", 3500),
+    selectMode: parseFoldArchiveInjectSelectMode(),
+    relevanceFallback: parseFoldArchiveInjectRelevanceFallback(),
+  };
+}

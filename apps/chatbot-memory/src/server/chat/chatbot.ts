@@ -1,4 +1,8 @@
-import { loadMemoryChatbotBehaviorConfig, parseEnvBool } from "../config/chat-env.js";
+import {
+  loadFoldArchiveInjectConfig,
+  loadMemoryChatbotBehaviorConfig,
+  parseEnvBool,
+} from "../config/chat-env.js";
 import { createCompleteNonStreaming, joinUrl } from "../llm/deepseek-client.js";
 import { parseSseDataLine } from "../llm/deepseek-sse.js";
 import { loadChatMcpPayloadLimits } from "../mcp/chat-mcp-limits.js";
@@ -8,14 +12,16 @@ import {
   streamChatWithMcpTools,
 } from "../mcp/chat-mcp-tools.js";
 import type { McpPool } from "../mcp/mcp.js";
+import type { FoldArchiveStore } from "../persistence/fold-archive-store.js";
 import type { SessionStore } from "../persistence/session-store.js";
 import type { UserFactsStore } from "../persistence/user-facts-store.js";
 import { readUtf8Lines, type ChatStreamPart } from "../shared/index.js";
-import type { SessionMemory } from "./chat-types.js";
+import type { ChatMessage, SessionMemory } from "./chat-types.js";
 import { filterDialogueByEntropyPrinciple } from "./entropy-ppl-filter.js";
-import { createEnqueueFold, createMemoryFold } from "./memory-fold.js";
+import { createEnqueueFold, createMemoryFold, type FoldArchiveEnqueueRef } from "./memory-fold.js";
 import { popIncrementalSummaryBatch, totalTurnChars, trimTurnsIfOverLimit } from "./memory-turns.js";
 import { buildSystemContent } from "./system-content.js";
+import { buildFoldArchiveInjectBlock } from "./fold-archive-inject.js";
 import { createAfterFoldUserFactsPromotion } from "./user-facts-promote.js";
 
 const fallbackSessions = new Map<string, SessionMemory>();
@@ -33,6 +39,26 @@ export type MemoryChatbotOptions = {
   sessionStore?: SessionStore;
   /** 传入则注入跨会话用户级事实，并在记忆折叠后自动合并新要点（见环境变量 CHAT_USER_FACTS_*） */
   userFactsStore?: UserFactsStore;
+  /**
+   * 折叠进摘要前：被移出的原始轮次（可在此写入本地归档）。
+   * 返回 `{ index, createdAt }` 可与 `onFoldArchiveFinalized` 联动做强关联。
+   */
+  onFoldDroppedArchive?: (params: {
+    sessionId: string;
+    mode: "incremental" | "trim";
+    dropped: ChatMessage[];
+  }) => void | Promise<void | FoldArchiveEnqueueRef | null | undefined>;
+  /** 归档已写且本轮折叠成功、会话 summary/facts 已更新后（如回填 layers、写入 `foldArchiveLinks`） */
+  onFoldArchiveFinalized?: (params: {
+    sessionId: string;
+    mode: "incremental" | "trim";
+    ref: FoldArchiveEnqueueRef;
+    session: SessionMemory;
+    previousSummary: string | undefined;
+    previousFacts: string | undefined;
+  }) => void | Promise<void>;
+  /** 传入则每轮对话自动将 `foldArchiveLinks` 对应磁盘归档节选拼入 system（需与归档存储同时启用） */
+  foldArchiveInjectStore?: FoldArchiveStore;
 };
 
 /**
@@ -52,6 +78,8 @@ export function createMemoryChatbot(options?: MemoryChatbotOptions) {
     "你的名字是「知忆」，一位沉稳、专业的中文对话伙伴。根据完整对话历史作答，主动记住用户提到的偏好、事实与约定，并在后续回复中自然运用。语气简洁有礼，避免机械套话。";
 
   const behavior = loadMemoryChatbotBehaviorConfig(model);
+  const foldArchiveInjectStore = options?.foldArchiveInjectStore;
+  const foldArchiveInjectCfg = foldArchiveInjectStore ? loadFoldArchiveInjectConfig() : null;
   const chatUrl = joinUrl(baseURL, "/v1/chat/completions");
   const completeNonStreaming = createCompleteNonStreaming({
     chatUrl,
@@ -67,6 +95,8 @@ export function createMemoryChatbot(options?: MemoryChatbotOptions) {
 
   const enqueueFold = createEnqueueFold(foldDroppedIntoLayers, behavior.summarizeOnTrim, {
     onFoldSettled: sessionStore ? (id) => sessionStore.onFoldSettled(id) : undefined,
+    onArchiveDropped: options?.onFoldDroppedArchive,
+    onFoldArchiveFinalized: options?.onFoldArchiveFinalized,
     onAfterFold:
       userFactsStore &&
       createAfterFoldUserFactsPromotion({
@@ -102,7 +132,33 @@ export function createMemoryChatbot(options?: MemoryChatbotOptions) {
     const session = getSession(sessionId);
     const wasEmptyBeforeTurn = session.turns.length === 0;
 
-    const systemContent = buildSystemContent(session, systemPrompt, userFactsStore?.getFacts());
+    let foldArchiveDigest: string | undefined;
+    if (
+      foldArchiveInjectStore &&
+      foldArchiveInjectCfg?.enabled &&
+      session.foldArchiveLinks?.length
+    ) {
+      foldArchiveDigest = await buildFoldArchiveInjectBlock(
+        foldArchiveInjectStore,
+        sessionId,
+        session.foldArchiveLinks,
+        {
+          maxEntries: foldArchiveInjectCfg.maxEntries,
+          maxTotalChars: foldArchiveInjectCfg.maxTotalChars,
+          turnsMaxCharsPerEntry: foldArchiveInjectCfg.turnsMaxCharsPerEntry,
+          selectMode: foldArchiveInjectCfg.selectMode,
+          relevanceFallback: foldArchiveInjectCfg.relevanceFallback,
+        },
+        input,
+      );
+    }
+
+    const systemContent = buildSystemContent(
+      session,
+      systemPrompt,
+      userFactsStore?.getFacts(),
+      foldArchiveDigest,
+    );
     let turnsForApi = session.turns;
     let userContentForApi = input;
 
@@ -256,6 +312,7 @@ export function createMemoryChatbot(options?: MemoryChatbotOptions) {
           s.turns = [];
           delete s.summary;
           delete s.facts;
+          delete s.foldArchiveLinks;
           s.foldChain = undefined;
         }
       }

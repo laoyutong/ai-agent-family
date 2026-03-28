@@ -4,7 +4,8 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import process from "node:process";
-import type { ChatMessage, SessionMemory } from "../chat/chat-types.js";
+import type { ChatMessage, FoldArchiveLink, SessionMemory } from "../chat/chat-types.js";
+import type { FoldArchiveStore } from "./fold-archive-store.js";
 
 const FILE_VERSION = 1;
 const MANIFEST_NAME = "manifest.json";
@@ -15,6 +16,7 @@ export type PersistedSessionBlob = {
   turns: ChatMessage[];
   summary?: string;
   facts?: string;
+  foldArchiveLinks?: FoldArchiveLink[];
 };
 
 export type PersistedSessionsFile = {
@@ -132,14 +134,26 @@ function memoryToBlob(memory: SessionMemory, title: string, updatedAt: number): 
     turns: memory.turns,
     summary: memory.summary,
     facts: memory.facts,
+    ...(memory.foldArchiveLinks?.length ? { foldArchiveLinks: memory.foldArchiveLinks } : {}),
   };
 }
 
 function blobToMemory(blob: PersistedSessionBlob): SessionMemory {
+  const links =
+    Array.isArray(blob.foldArchiveLinks) && blob.foldArchiveLinks.length > 0
+      ? blob.foldArchiveLinks.filter(
+          (l) =>
+            l &&
+            typeof l.index === "number" &&
+            (l.mode === "incremental" || l.mode === "trim") &&
+            typeof l.createdAt === "number",
+        )
+      : undefined;
   return {
     turns: blob.turns ?? [],
     summary: blob.summary,
     facts: blob.facts,
+    ...(links?.length ? { foldArchiveLinks: links } : {}),
   };
 }
 
@@ -159,9 +173,17 @@ export class SessionStore {
   private pendingDeletes = new Set<string>();
   private pendingClearAll = false;
 
+  /** 与会话 id 绑定的折叠归档；删除会话时同步清空对应子目录 */
+  private foldArchive: FoldArchiveStore | null = null;
+
   constructor(options: { mode: "sharded" | "legacy"; path: string }) {
     this.mode = options.mode;
     this.filePath = options.path;
+  }
+
+  /** 在创建 `FoldArchiveStore` 后绑定，以便 `deleteSession` / `clearAllSessions` 同步清理磁盘归档 */
+  bindFoldArchive(store: FoldArchiveStore | null): void {
+    this.foldArchive = store;
   }
 
   static defaultPath(): string {
@@ -311,6 +333,7 @@ export class SessionStore {
     m.turns = [];
     delete m.summary;
     delete m.facts;
+    delete m.foldArchiveLinks;
     m.foldChain = undefined;
     const meta = this.meta.get(id);
     if (meta) {
@@ -326,6 +349,7 @@ export class SessionStore {
     const ok = this.memories.delete(id);
     this.meta.delete(id);
     if (ok) {
+      this.foldArchive?.removeSessionArchivesSync(id);
       if (this.mode === "sharded") {
         this.pendingDeletes.add(id);
         this.dirtyIds.delete(id);
@@ -340,6 +364,7 @@ export class SessionStore {
     this.meta.clear();
     this.dirtyIds.clear();
     this.pendingDeletes.clear();
+    this.foldArchive?.clearAllSync();
     if (this.mode === "sharded") {
       this.pendingClearAll = true;
     }
@@ -394,6 +419,7 @@ export class SessionStore {
         turns: ChatMessage[];
         summary?: string;
         facts?: string;
+        foldArchiveLinks?: FoldArchiveLink[];
       }
     | undefined {
     const memory = this.memories.get(id);
@@ -406,6 +432,7 @@ export class SessionStore {
       turns: memory.turns,
       summary: memory.summary,
       facts: memory.facts,
+      ...(memory.foldArchiveLinks?.length ? { foldArchiveLinks: memory.foldArchiveLinks } : {}),
     };
   }
 

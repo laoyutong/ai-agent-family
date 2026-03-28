@@ -2,6 +2,11 @@ import express from "express";
 import { createMemoryChatbot } from "../chat/chatbot.js";
 import { parseIntEnv } from "../config/chat-env.js";
 import { createDisabledMcpPool, createMcpPool, type McpPool } from "../mcp/mcp.js";
+import {
+  FoldArchiveStore,
+  parseFoldArchiveEnabled,
+  resolveFoldArchiveBaseDir,
+} from "../persistence/fold-archive-store.js";
 import { createSessionStore, type SessionStore } from "../persistence/session-store.js";
 import { createUserFactsStore, UserFactsStore } from "../persistence/user-facts-store.js";
 
@@ -32,7 +37,42 @@ export async function createApiApp(): Promise<ApiAppResult> {
     UserFactsStore.defaultPath(),
     userFactsMaxLines,
   );
-  const bot = createMemoryChatbot({ mcp, sessionStore, userFactsStore });
+
+  const foldArchiveEnabled = parseFoldArchiveEnabled();
+  const foldArchiveStore = foldArchiveEnabled
+    ? new FoldArchiveStore(resolveFoldArchiveBaseDir(sessionStore))
+    : null;
+  sessionStore.bindFoldArchive(foldArchiveStore);
+
+  const bot = createMemoryChatbot({
+    mcp,
+    sessionStore,
+    userFactsStore,
+    foldArchiveInjectStore: foldArchiveStore ?? undefined,
+    onFoldDroppedArchive: foldArchiveStore
+      ? async ({ sessionId, mode, dropped }) => {
+          const mem = sessionStore.getMemory(sessionId);
+          return foldArchiveStore.append(sessionId, mode, dropped, {
+            summaryBefore: mem?.summary,
+            factsBefore: mem?.facts,
+          });
+        }
+      : undefined,
+    onFoldArchiveFinalized: foldArchiveStore
+      ? async ({ sessionId, mode, ref, session }) => {
+          await foldArchiveStore.finalizeEntry(sessionId, ref.index, {
+            summaryAfter: session.summary,
+            factsAfter: session.facts,
+          });
+          session.foldArchiveLinks = session.foldArchiveLinks ?? [];
+          session.foldArchiveLinks.push({
+            index: ref.index,
+            mode,
+            createdAt: ref.createdAt,
+          });
+        }
+      : undefined,
+  });
 
   const app = express();
   app.use(express.json({ limit: "1mb" }));
@@ -159,6 +199,48 @@ export async function createApiApp(): Promise<ApiAppResult> {
   app.post("/api/sessions", (_req, res) => {
     const id = sessionStore.createSession();
     res.status(201).json({ id });
+  });
+
+  app.get("/api/sessions/:sessionId/fold-archives", async (req, res) => {
+    const sessionId = typeof req.params.sessionId === "string" ? req.params.sessionId.trim() : "";
+    if (!sessionId) {
+      res.status(400).json({ error: "缺少 sessionId" });
+      return;
+    }
+    if (!sessionStore.has(sessionId)) {
+      res.status(404).json({ error: "会话不存在" });
+      return;
+    }
+    if (!foldArchiveStore) {
+      res.json({ enabled: false, entries: [] });
+      return;
+    }
+    const entries = await foldArchiveStore.list(sessionId);
+    res.json({ enabled: true, entries });
+  });
+
+  app.get("/api/sessions/:sessionId/fold-archives/:index", async (req, res) => {
+    const sessionId = typeof req.params.sessionId === "string" ? req.params.sessionId.trim() : "";
+    const idxRaw = typeof req.params.index === "string" ? req.params.index.trim() : "";
+    const index = Number.parseInt(idxRaw, 10);
+    if (!sessionId) {
+      res.status(400).json({ error: "缺少 sessionId" });
+      return;
+    }
+    if (!sessionStore.has(sessionId)) {
+      res.status(404).json({ error: "会话不存在" });
+      return;
+    }
+    if (!foldArchiveStore) {
+      res.status(404).json({ error: "归档未启用" });
+      return;
+    }
+    const rec = await foldArchiveStore.get(sessionId, index);
+    if (!rec) {
+      res.status(404).json({ error: "归档不存在" });
+      return;
+    }
+    res.json(rec);
   });
 
   app.get("/api/sessions/:sessionId", (req, res) => {

@@ -31,7 +31,7 @@ export function createMemoryFold(completeNonStreaming: CompleteNonStreaming) {
       {
         role: "system",
         content:
-          "你是对话摘要助手。将「既有摘要」（若有）与「待合并对话」合并为极简中文要点：只写结论、决定与不可替代的专名/数字，不写过程与寒暄，不逐句复述。合并去重后**总长不超过约 300 字**（宁短勿长）。",
+          "你是对话摘要助手。将「既有摘要」（若有）与「待合并对话」合并为极简中文要点：只写结论、决定与不可替代的专名/数字，不写过程与寒暄，不逐句复述。合并去重后**总长不超过约 300 字**（宁短勿长）。摘要用于与本地保存的「原文归档」索引对照，须保留可追溯的**主题/结论短语**（无需标注序号）。",
       },
       { role: "user", content: body },
     ]);
@@ -54,7 +54,7 @@ export function createMemoryFold(completeNonStreaming: CompleteNonStreaming) {
         role: "system",
         content:
           "你是记忆分层助手。根据「既有会话摘要」「既有长期要点」（可无）与「待合并对话」，输出**仅**一个 JSON 对象，键为 summary 与 facts，不要 markdown 代码块或其它说明文字。\n" +
-            "summary：用一两段极短中文概括**仍对后续对话有用**的脉络（话题+结论/立场），不写细节与铺垫；与既有摘要合并去重后**总长不超过约 300 字**。\n" +
+            "summary：用一两段极短中文概括**仍对后续对话有用**的脉络（话题+结论/立场），不写细节与铺垫；与既有摘要合并去重后**总长不超过约 300 字**。summary 会与本地「原文轮次归档」并存，请用**可区分话题的短标签式表述**便于按主题回看原文。\n" +
             "facts：每行一条，仅用户偏好、硬事实、约定、专名与关键数字；合并既有长期要点并去重，**不超过 20 行**，能合并成一条的不要拆成多条。",
       },
       { role: "user", content: userContent },
@@ -81,6 +81,11 @@ export function createMemoryFold(completeNonStreaming: CompleteNonStreaming) {
   return { foldDroppedIntoLayers };
 }
 
+export type FoldArchiveEnqueueRef = {
+  index: number;
+  createdAt: number;
+};
+
 /**
  * 生成「异步排队折叠」函数：把移出的对话串到 `session.foldChain` 上，避免并发写 summary/facts。
  * - `incremental`：定时增量摘要，总是尝试折叠；
@@ -92,6 +97,26 @@ export function createEnqueueFold(
   options?: {
     /** 单次折叠 promise 结束后调用（如写入会话持久化） */
     onFoldSettled?: (sessionId: string) => void;
+    /**
+     * 在调用模型折叠之前：原始被移出轮次已可安全落盘（与 summary 解耦，供索引检索）。
+     * 返回 `{ index, createdAt }` 时，折叠成功后触发 `onFoldArchiveFinalized`。
+     */
+    onArchiveDropped?: (params: {
+      sessionId: string;
+      mode: "incremental" | "trim";
+      dropped: ChatMessage[];
+    }) => void | Promise<void | FoldArchiveEnqueueRef | null | undefined>;
+    /**
+     * `onArchiveDropped` 已落盘且本轮模型折叠成功、`session.summary` / `facts` 已更新后调用（如回填归档、写入 `foldArchiveLinks`）。
+     */
+    onFoldArchiveFinalized?: (params: {
+      sessionId: string;
+      mode: "incremental" | "trim";
+      ref: FoldArchiveEnqueueRef;
+      session: SessionMemory;
+      previousSummary: string | undefined;
+      previousFacts: string | undefined;
+    }) => void | Promise<void>;
     /**
      * 折叠成功并写回 `session.summary` / `session.facts` 之后调用（如同步到用户级事实库）。
      * `previousSummary` / `previousFacts` 为折叠前的会话层快照。
@@ -121,6 +146,18 @@ export function createEnqueueFold(
 
     session.foldChain = (session.foldChain ?? Promise.resolve())
       .then(async () => {
+        const sid = sessionId ?? "";
+        let archiveRef: FoldArchiveEnqueueRef | undefined;
+        if (sid) {
+          try {
+            const r = await options?.onArchiveDropped?.({ sessionId: sid, mode, dropped });
+            if (r && typeof r.index === "number" && r.index >= 1 && typeof r.createdAt === "number") {
+              archiveRef = { index: r.index, createdAt: r.createdAt };
+            }
+          } catch (archErr) {
+            console.error("[memory-fold] onArchiveDropped 失败:", archErr);
+          }
+        }
         const previousSummary = session.summary;
         const previousFacts = session.facts;
         try {
@@ -131,6 +168,20 @@ export function createEnqueueFold(
           );
           session.summary = summary.trim() || undefined;
           session.facts = facts.trim() || undefined;
+          if (archiveRef && sid) {
+            try {
+              await options?.onFoldArchiveFinalized?.({
+                sessionId: sid,
+                mode,
+                ref: archiveRef,
+                session,
+                previousSummary,
+                previousFacts,
+              });
+            } catch (linkErr) {
+              console.error("[memory-fold] onFoldArchiveFinalized 失败:", linkErr);
+            }
+          }
           try {
             await options?.onAfterFold?.({
               sessionId,
