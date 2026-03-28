@@ -26,11 +26,34 @@ import { createAfterFoldUserFactsPromotion } from "./user-facts-promote.js";
 
 const fallbackSessions = new Map<string, SessionMemory>();
 
+/** 与 `logChatPhase` 的 phase 键一一对应，便于日志中快速读懂阶段含义 */
+const CHAT_PHASE_ZH: Record<string, string> = {
+  entropy_filter_async_start: "回合结束后异步熵过滤开始",
+  entropy_filter_async_skip: "异步熵过滤跳过（会话已变或角色不符）",
+  entropy_filter_async_done: "异步熵过滤结束",
+  turn_start: "新用户回合开始",
+  fold_archive_inject: "折叠归档节选注入 system",
+  entropy_gate: "熵过滤门槛与本轮结束后是否可异步压缩",
+  mcp_tools_list_ready: "MCP 工具列表已拉取",
+  parallel_prefetch_done: "并行预取完成（含工具列表）",
+  messages_ready: "发给模型的 messages 已组装",
+  mcp_branch_enter: "进入 MCP 工具分支",
+  mcp_router_llm: "LLM 判定是否走 MCP 工具路径",
+  mcp_route: "MCP 路由结果（工具路径/启发式）",
+  stream_start: "流式回复开始",
+  stream_done: "流式回复结束",
+  turn_persisted: "本轮已写入会话 turns",
+  fold_scheduled: "增量摘要/超长裁切折叠已入队",
+  mcp_branch_skipped: "未走 MCP（未配置或启发式跳过）",
+};
+
 function logChatPhase(phase: string, detail?: Record<string, unknown>) {
+  const zh = CHAT_PHASE_ZH[phase];
+  const head = zh !== undefined ? `[Chat] ${phase} · ${zh}` : `[Chat] ${phase}`;
   if (detail !== undefined && Object.keys(detail).length > 0) {
-    console.log(`[Chat] ${phase}`, detail);
+    console.log(head, detail);
   } else {
-    console.log(`[Chat] ${phase}`);
+    console.log(head);
   }
 }
 

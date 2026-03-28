@@ -3,6 +3,7 @@ import { Client } from "@modelcontextprotocol/sdk/client";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 
+import { parseIntEnv } from "../config/chat-env.js";
 import { stringifyUnknownForLog } from "../util/log-preview.js";
 
 const CLIENT = { name: "chatbot-memory", version: "0.0.0" };
@@ -201,6 +202,54 @@ export async function createMcpPool(): Promise<McpPool> {
 
   const configured = configs.length > 0;
 
+  type ListedTool = Array<{
+    serverId: string;
+    name: string;
+    description?: string;
+    inputSchema: unknown;
+  }>;
+
+  let listToolsCache: { data: ListedTool; expiresAt: number } | null = null;
+  let listToolsInFlight: Promise<ListedTool> | null = null;
+
+  async function fetchListToolsFromServers(): Promise<ListedTool> {
+    mcpLog("listTools:start", { servers: entries.length });
+    const t0 = performance.now();
+    const out: ListedTool = [];
+    for (const { id, client } of entries) {
+      const t1 = performance.now();
+      let pageIdx = 0;
+      let countForServer = 0;
+      let cursor: string | undefined;
+      for (;;) {
+        pageIdx += 1;
+        const page = await client.listTools(cursor ? { cursor } : {});
+        countForServer += page.tools.length;
+        for (const t of page.tools) {
+          out.push({ serverId: id, name: t.name, description: t.description, inputSchema: t.inputSchema });
+        }
+        mcpLog("listTools:page", {
+          serverId: id,
+          page: pageIdx,
+          batch: page.tools.length,
+          hasMore: !!page.nextCursor,
+        });
+        if (!page.nextCursor) break;
+        cursor = page.nextCursor;
+      }
+      mcpLog("listTools:serverDone", {
+        serverId: id,
+        tools: countForServer,
+        ms: Math.round(performance.now() - t1),
+      });
+    }
+    mcpLog("listTools:done", {
+      totalTools: out.length,
+      ms: Math.round(performance.now() - t0),
+    });
+    return out;
+  }
+
   return {
     configured,
     getStatus: () =>
@@ -215,41 +264,33 @@ export async function createMcpPool(): Promise<McpPool> {
         };
       }),
     listTools: async () => {
-      mcpLog("listTools:start", { servers: entries.length });
-      const t0 = performance.now();
-      const out: Array<{ serverId: string; name: string; description?: string; inputSchema: unknown }> = [];
-      for (const { id, client } of entries) {
-        const t1 = performance.now();
-        let pageIdx = 0;
-        let countForServer = 0;
-        let cursor: string | undefined;
-        for (;;) {
-          pageIdx += 1;
-          const page = await client.listTools(cursor ? { cursor } : {});
-          countForServer += page.tools.length;
-          for (const t of page.tools) {
-            out.push({ serverId: id, name: t.name, description: t.description, inputSchema: t.inputSchema });
-          }
-          mcpLog("listTools:page", {
-            serverId: id,
-            page: pageIdx,
-            batch: page.tools.length,
-            hasMore: !!page.nextCursor,
-          });
-          if (!page.nextCursor) break;
-          cursor = page.nextCursor;
-        }
-        mcpLog("listTools:serverDone", {
-          serverId: id,
-          tools: countForServer,
-          ms: Math.round(performance.now() - t1),
-        });
+      const ttlMs = parseIntEnv("MCP_LIST_TOOLS_CACHE_TTL_MS", 180_000);
+      if (ttlMs === 0) {
+        listToolsCache = null;
       }
-      mcpLog("listTools:done", {
-        totalTools: out.length,
-        ms: Math.round(performance.now() - t0),
-      });
-      return out;
+      const now = Date.now();
+      if (ttlMs > 0 && listToolsCache !== null && now < listToolsCache.expiresAt) {
+        mcpLog("listTools:cache_hit", {
+          totalTools: listToolsCache.data.length,
+          ttlMs,
+          remainingMs: listToolsCache.expiresAt - now,
+        });
+        return structuredClone(listToolsCache.data);
+      }
+      if (!listToolsInFlight) {
+        listToolsInFlight = fetchListToolsFromServers()
+          .then((data) => {
+            if (ttlMs > 0) {
+              listToolsCache = { data, expiresAt: Date.now() + ttlMs };
+            }
+            return data;
+          })
+          .finally(() => {
+            listToolsInFlight = null;
+          });
+      }
+      const fresh = await listToolsInFlight;
+      return structuredClone(fresh);
     },
     callTool: async (serverId, name, args) => {
       const e = entries.find((x) => x.id === serverId);
@@ -296,6 +337,7 @@ export async function createMcpPool(): Promise<McpPool> {
       }
     },
     close: async () => {
+      listToolsCache = null;
       const n = entries.length;
       if (n === 0) {
         mcpLog("close", { step: "skip", reason: "无活跃连接" });
