@@ -1,4 +1,4 @@
-import type { ChatMessage } from "./chat-types.js";
+import type { ChatMessage } from "../chat/chat-types.js";
 
 /** OpenAI 兼容 chat/completions 的 message 行（非流式） */
 export type ChatCompletionMessageRow = { role: string; content?: string | null };

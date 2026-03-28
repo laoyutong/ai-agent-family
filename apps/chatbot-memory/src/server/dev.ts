@@ -1,8 +1,8 @@
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { createServer as createViteServer } from "vite";
-import { createApiApp } from "./app.js";
-import { requireDeepseekApiKey } from "./require-api-key.js";
+import { createApiApp } from "./http/app.js";
+import { requireDeepseekApiKey } from "./config/require-api-key.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 /** apps/chatbot-memory 根目录 */

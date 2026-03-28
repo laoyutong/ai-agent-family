@@ -4,7 +4,7 @@ import { Client } from "@modelcontextprotocol/sdk/client";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 
-import { stringifyUnknownForLog } from "./log-preview.js";
+import { stringifyUnknownForLog } from "../util/log-preview.js";
 
 const CLIENT = { name: "chatbot-memory", version: "0.0.0" };
 

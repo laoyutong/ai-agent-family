@@ -1,5 +1,5 @@
 import type { ChatMessage, SessionMemory } from "./chat-types.js";
-import type { MemoryChatbotBehaviorConfig } from "./chat-env.js";
+import type { MemoryChatbotBehaviorConfig } from "../config/chat-env.js";
 
 /** 统计多轮对话正文总字符数（用于是否超长裁切） */
 export function totalTurnChars(turns: ChatMessage[]): number {

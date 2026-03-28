@@ -4,8 +4,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import process from "node:process";
-import type { ChatMessage } from "./chat-types.js";
-import type { SessionMemory } from "./chat-types.js";
+import type { ChatMessage, SessionMemory } from "../chat/chat-types.js";
 
 const FILE_VERSION = 1;
 const MANIFEST_NAME = "manifest.json";

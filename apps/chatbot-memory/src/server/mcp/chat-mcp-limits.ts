@@ -1,4 +1,4 @@
-import { parseIntEnv } from "./chat-env.js";
+import { parseIntEnv } from "../config/chat-env.js";
 
 export type ChatMcpPayloadLimits = {
   maxTools: number;

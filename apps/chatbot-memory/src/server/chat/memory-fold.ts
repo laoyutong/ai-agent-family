@@ -1,5 +1,5 @@
 import type { ChatMessage, SessionMemory } from "./chat-types.js";
-import type { CompleteNonStreaming } from "./deepseek-client.js";
+import type { CompleteNonStreaming } from "../llm/deepseek-client.js";
 import { formatTurnsForSummary } from "./memory-turns.js";
 
 /** 解析记忆分层模型返回的 JSON（可带 markdown 围栏），提取 summary / facts 字段 */

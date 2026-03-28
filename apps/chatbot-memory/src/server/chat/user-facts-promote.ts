@@ -1,7 +1,7 @@
-import type { CompleteNonStreaming } from "./deepseek-client.js";
+import type { CompleteNonStreaming } from "../llm/deepseek-client.js";
 import type { SessionMemory } from "./chat-types.js";
-import { lineDeltaFromFacts } from "./user-facts-store.js";
-import type { UserFactsStore } from "./user-facts-store.js";
+import { lineDeltaFromFacts } from "../persistence/user-facts-store.js";
+import type { UserFactsStore } from "../persistence/user-facts-store.js";
 
 /**
  * 从会话折叠新增的 facts 行中，筛出适合写入**所有会话**的长期条目（可选 LLM，失败则回退为直接使用增量行）。

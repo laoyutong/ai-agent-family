@@ -4,7 +4,7 @@ import { fork, type ChildProcess } from "node:child_process";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import vm from "node:vm";
-import { parseEnvBool } from "./chat-env.js";
+import { parseEnvBool } from "../config/chat-env.js";
 import type { McpPool } from "./mcp.js";
 
 /** 子进程不应继承的敏感/可滥用环境变量名模式（仅块级删除键名，不记录值） */

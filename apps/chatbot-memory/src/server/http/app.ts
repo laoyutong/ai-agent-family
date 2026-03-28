@@ -1,9 +1,9 @@
 import express from "express";
-import { parseIntEnv } from "./chat-env.js";
-import { createMemoryChatbot } from "./chatbot.js";
-import { createDisabledMcpPool, createMcpPool, type McpPool } from "./mcp.js";
-import { createSessionStore, type SessionStore } from "./session-store.js";
-import { createUserFactsStore, UserFactsStore } from "./user-facts-store.js";
+import { parseIntEnv } from "../config/chat-env.js";
+import { createMemoryChatbot } from "../chat/chatbot.js";
+import { createDisabledMcpPool, createMcpPool, type McpPool } from "../mcp/mcp.js";
+import { createSessionStore, type SessionStore } from "../persistence/session-store.js";
+import { createUserFactsStore, UserFactsStore } from "../persistence/user-facts-store.js";
 
 export type ApiAppResult = {
   app: express.Application;
