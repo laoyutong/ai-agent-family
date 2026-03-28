@@ -26,6 +26,14 @@ import { createAfterFoldUserFactsPromotion } from "./user-facts-promote.js";
 
 const fallbackSessions = new Map<string, SessionMemory>();
 
+function logChatPhase(phase: string, detail?: Record<string, unknown>) {
+  if (detail !== undefined && Object.keys(detail).length > 0) {
+    console.log(`[Chat] ${phase}`, detail);
+  } else {
+    console.log(`[Chat] ${phase}`);
+  }
+}
+
 /** 仅覆盖 API 与人设；记忆策略、熵过滤等见环境变量 */
 export type MemoryChatbotOptions = {
   model?: string;
@@ -62,7 +70,8 @@ export type MemoryChatbotOptions = {
 };
 
 /**
- * 创建带会话记忆的流式聊天实例：熵过滤 → 主对话流式输出 → 写入 turns → 增量摘要与超长裁切折叠。
+ * 创建带会话记忆的流式聊天实例：主对话流式输出 → 写入 turns → 增量摘要与超长裁切折叠；
+ * 熵过滤在回合结束后异步压缩 `session.turns`（不阻塞首包与流式）。
  * 记忆策略由环境变量控制（见 `loadMemoryChatbotBehaviorConfig`）。
  */
 export function createMemoryChatbot(options?: MemoryChatbotOptions) {
@@ -119,10 +128,78 @@ export function createMemoryChatbot(options?: MemoryChatbotOptions) {
     return session;
   }
 
+  /** 回合已落盘且同步折叠完成后：异步压缩历史 + 最后一条 user，不改动本轮 assistant 正文；供下一轮起使用 */
+  function scheduleEntropyCompressAfterTurn(session: SessionMemory, sessionId: string): void {
+    const chars = totalTurnChars(session.turns);
+    const gate =
+      behavior.entropyPerplexityFilter &&
+      (behavior.entropyFilterMinChars === 0 || chars >= behavior.entropyFilterMinChars);
+    if (!gate) return;
+
+    const snapshotLen = session.turns.length;
+    if (snapshotLen < 2) return;
+
+    void (async () => {
+      logChatPhase("entropy_filter_async_start", {
+        sessionId,
+        turns: snapshotLen,
+        chars,
+      });
+      try {
+        const turns = session.turns;
+        if (turns.length !== snapshotLen) {
+          logChatPhase("entropy_filter_async_skip", { sessionId, reason: "turns_mutation" });
+          return;
+        }
+        const u = turns[turns.length - 2]!;
+        const a = turns[turns.length - 1]!;
+        if (u.role !== "user" || a.role !== "assistant") {
+          logChatPhase("entropy_filter_async_skip", { sessionId, reason: "unexpected_roles" });
+          return;
+        }
+
+        const earlier = turns.slice(0, -2) as Array<{ role: "user" | "assistant"; content: string }>;
+        const assistantSnapshot = a.content;
+
+        const filtered = await filterDialogueByEntropyPrinciple(
+          earlier,
+          u.content,
+          completeNonStreaming,
+          { model: behavior.entropyFilterModel, maxTokens: behavior.entropyFilterMaxTokens },
+        );
+
+        if (session.turns.length !== snapshotLen) {
+          logChatPhase("entropy_filter_async_skip", { sessionId, reason: "turns_mutation_after_api" });
+          return;
+        }
+        const last = session.turns[session.turns.length - 1]!;
+        if (last.role !== "assistant" || last.content !== assistantSnapshot) {
+          logChatPhase("entropy_filter_async_skip", { sessionId, reason: "turns_mutation_assistant" });
+          return;
+        }
+
+        session.turns = [
+          ...filtered.turns.map((t) => ({ role: t.role, content: t.content }) as ChatMessage),
+          { role: "user", content: filtered.currentUser },
+          { role: "assistant", content: assistantSnapshot },
+        ];
+        sessionStore?.onTurnsCompressed(sessionId);
+        logChatPhase("entropy_filter_async_done", {
+          sessionId,
+          turnsBefore: snapshotLen,
+          turnsAfter: session.turns.length,
+        });
+      } catch (e) {
+        console.error("entropy/perplexity async compress failed:", e);
+        logChatPhase("entropy_filter_async_done", { sessionId, ok: false });
+      }
+    })();
+  }
+
   /**
-   * 单轮用户消息：取/建会话 → 组 messages（可选熵过滤）
-   * → 若 MCP 有工具且路由判定需要外部能力则走 streamChatWithMcpTools（代码沙盒 + 最终流式），否则 DeepSeek 流式
-   * → 写入 turns → 摘要/裁切队列。
+   * 单轮用户消息：取/建会话 → 组 messages（本轮主对话用未熵过滤的 turns，与 listTools 并行仅等工具列表）
+   * → 若 MCP 有工具且路由判定需要外部能力则走 streamChatWithMcpTools，否则 DeepSeek 流式
+   * → 写入 turns → 摘要/裁切队列 → 异步熵压缩（供下一轮起生效）。
    */
   async function* streamChat(input: string, sessionId: string): AsyncGenerator<ChatStreamPart> {
     if (!apiKey) {
@@ -131,6 +208,11 @@ export function createMemoryChatbot(options?: MemoryChatbotOptions) {
 
     const session = getSession(sessionId);
     const wasEmptyBeforeTurn = session.turns.length === 0;
+    logChatPhase("turn_start", {
+      sessionId,
+      priorPairs: Math.floor(session.turns.length / 2),
+      userChars: input.length,
+    });
 
     let foldArchiveDigest: string | undefined;
     if (
@@ -152,6 +234,10 @@ export function createMemoryChatbot(options?: MemoryChatbotOptions) {
         input,
       );
     }
+    logChatPhase("fold_archive_inject", {
+      status: foldArchiveDigest !== undefined ? "injected" : "skipped",
+      ...(foldArchiveDigest !== undefined ? { digestChars: foldArchiveDigest.length } : {}),
+    });
 
     const systemContent = buildSystemContent(
       session,
@@ -166,6 +252,12 @@ export function createMemoryChatbot(options?: MemoryChatbotOptions) {
     const shouldEntropyFilter =
       behavior.entropyPerplexityFilter &&
       (behavior.entropyFilterMinChars === 0 || historyChars >= behavior.entropyFilterMinChars);
+    logChatPhase("entropy_gate", {
+      historyChars,
+      /** 回合结束后是否可能触发异步压缩（与落盘后 `totalTurnChars` 一致时再跑） */
+      entropyCompressAsyncEligible: shouldEntropyFilter,
+      entropyMinChars: behavior.entropyFilterMinChars,
+    });
 
     const routerEnabled = parseEnvBool("CHAT_MCP_TURN_ROUTER", true);
     const heuristicEnabled = parseEnvBool("CHAT_MCP_ROUTER_HEURISTIC", true);
@@ -177,40 +269,38 @@ export function createMemoryChatbot(options?: MemoryChatbotOptions) {
     const skipMcpByHeuristic = routerEnabled && heuristicEnabled && mcpHeuristic === false;
     const needToolsList = Boolean(mcpPool?.configured && !skipMcpByHeuristic);
 
-    const asTurns = turnsForApi as Array<{ role: "user" | "assistant"; content: string }>;
-    const entropyPromise = (async () => {
-      if (!shouldEntropyFilter) return;
-      try {
-        const filtered = await filterDialogueByEntropyPrinciple(
-          asTurns,
-          userContentForApi,
-          completeNonStreaming,
-          { model: behavior.entropyFilterModel, maxTokens: behavior.entropyFilterMaxTokens },
-        );
-        turnsForApi = filtered.turns;
-        userContentForApi = filtered.currentUser;
-      } catch (e) {
-        console.error("entropy/perplexity context filter failed:", e);
-      }
-    })();
-
-    const toolsPromise =
+    const toolsPromiseRaw =
       needToolsList && mcpPool
         ? mcpPool.listTools().catch((e) => {
             console.error("MCP listTools 失败，将回退为普通流式:", e);
             return [] as Awaited<ReturnType<McpPool["listTools"]>>;
           })
-        : Promise.resolve([]);
+        : Promise.resolve([] as Awaited<ReturnType<McpPool["listTools"]>>);
+    const toolsPromise = toolsPromiseRaw.then((listed) => {
+      logChatPhase("mcp_tools_list_ready", { toolCount: listed.length });
+      return listed;
+    });
 
-    const [, listed] = await Promise.all([entropyPromise, toolsPromise]);
+    const listed = await toolsPromise;
+    logChatPhase("parallel_prefetch_done", {
+      mcpToolCount: listed.length,
+      entropyCompressAsyncAfterTurn: shouldEntropyFilter,
+    });
 
     const messages = [
       { role: "system" as const, content: systemContent },
       ...turnsForApi,
       { role: "user" as const, content: userContentForApi },
     ];
+    logChatPhase("messages_ready", {
+      sessionId,
+      messageCount: messages.length,
+      systemChars: systemContent.length,
+      historyTurns: turnsForApi.length,
+    });
 
     if (mcpPool?.configured && !skipMcpByHeuristic) {
+      logChatPhase("mcp_branch_enter", { toolsListed: listed.length });
       try {
         if (listed.length > 0) {
           const limits = loadChatMcpPayloadLimits();
@@ -225,11 +315,18 @@ export function createMemoryChatbot(options?: MemoryChatbotOptions) {
                 listed,
                 limits,
               });
+              logChatPhase("mcp_router_llm", { useMcpTools: useMcpPath });
             } catch (e) {
               console.error("MCP 路由判断失败，回退为走 MCP 路径:", e);
             }
           }
+          logChatPhase("mcp_route", {
+            useMcpTools: useMcpPath,
+            heuristic: mcpHeuristic,
+            skipByHeuristic: skipMcpByHeuristic,
+          });
           if (useMcpPath) {
+            logChatPhase("stream_start", { path: "mcp_tools", sessionId });
             let assistantFull = "";
             for await (const chunk of streamChatWithMcpTools({
               mcp: mcpPool,
@@ -246,20 +343,40 @@ export function createMemoryChatbot(options?: MemoryChatbotOptions) {
             session.turns.push({ role: "user", content: input });
             session.turns.push({ role: "assistant", content: assistantFull });
             sessionStore?.onTurnCommitted(sessionId, input, wasEmptyBeforeTurn);
+            logChatPhase("stream_done", {
+              path: "mcp_tools",
+              sessionId,
+              assistantChars: assistantFull.length,
+            });
+            logChatPhase("turn_persisted", {
+              sessionId,
+              turnPairs: Math.floor(session.turns.length / 2),
+            });
 
             const droppedIncremental = popIncrementalSummaryBatch(session, behavior.incrementalSummaryEveryNPairs);
             enqueueFold(session, droppedIncremental, "incremental", sessionId);
 
             const droppedTrim = trimTurnsIfOverLimit(session, behavior);
             enqueueFold(session, droppedTrim, "trim", sessionId);
+            logChatPhase("fold_scheduled", {
+              incrementalMsgs: droppedIncremental.length,
+              trimMsgs: droppedTrim.length,
+            });
+            scheduleEntropyCompressAfterTurn(session, sessionId);
             return;
           }
         }
       } catch (e) {
         console.error("MCP 工具对话失败，回退为普通流式:", e);
       }
+    } else {
+      logChatPhase("mcp_branch_skipped", {
+        configured: Boolean(mcpPool?.configured),
+        skipMcpByHeuristic,
+      });
     }
 
+    logChatPhase("stream_start", { path: "deepseek_sse", sessionId });
     const res = await fetch(chatUrl, {
       method: "POST",
       headers: {
@@ -291,12 +408,26 @@ export function createMemoryChatbot(options?: MemoryChatbotOptions) {
     session.turns.push({ role: "user", content: input });
     session.turns.push({ role: "assistant", content: assistantFull });
     sessionStore?.onTurnCommitted(sessionId, input, wasEmptyBeforeTurn);
+    logChatPhase("stream_done", {
+      path: "deepseek_sse",
+      sessionId,
+      assistantChars: assistantFull.length,
+    });
+    logChatPhase("turn_persisted", {
+      sessionId,
+      turnPairs: Math.floor(session.turns.length / 2),
+    });
 
     const droppedIncremental = popIncrementalSummaryBatch(session, behavior.incrementalSummaryEveryNPairs);
     enqueueFold(session, droppedIncremental, "incremental", sessionId);
 
     const droppedTrim = trimTurnsIfOverLimit(session, behavior);
     enqueueFold(session, droppedTrim, "trim", sessionId);
+    logChatPhase("fold_scheduled", {
+      incrementalMsgs: droppedIncremental.length,
+      trimMsgs: droppedTrim.length,
+    });
+    scheduleEntropyCompressAfterTurn(session, sessionId);
   }
 
   return {

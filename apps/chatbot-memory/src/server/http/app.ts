@@ -135,6 +135,7 @@ export async function createApiApp(): Promise<ApiAppResult> {
       return;
     }
     const sessionId = getSessionId(req);
+    console.log("[Chat][HTTP] POST /api/chat", { sessionId, userChars: message.length });
 
     res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
     res.setHeader("Cache-Control", "no-cache, no-transform");

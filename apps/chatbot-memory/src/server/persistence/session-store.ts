@@ -402,6 +402,14 @@ export class SessionStore {
     void this.enqueueSave();
   }
 
+  /** 熵过滤等异步重写 `turns` 后落盘（不改变标题） */
+  onTurnsCompressed(sessionId: string): void {
+    const meta = this.meta.get(sessionId);
+    if (meta) meta.updatedAt = Date.now();
+    this.markDirty(sessionId);
+    void this.enqueueSave();
+  }
+
   listSessions(): Array<{ id: string; title: string; updatedAt: number }> {
     const out: Array<{ id: string; title: string; updatedAt: number }> = [];
     for (const [id, m] of this.meta.entries()) {
