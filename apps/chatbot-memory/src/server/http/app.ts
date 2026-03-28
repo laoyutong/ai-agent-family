@@ -1,6 +1,6 @@
 import express from "express";
-import { parseIntEnv } from "../config/chat-env.js";
 import { createMemoryChatbot } from "../chat/chatbot.js";
+import { parseIntEnv } from "../config/chat-env.js";
 import { createDisabledMcpPool, createMcpPool, type McpPool } from "../mcp/mcp.js";
 import { createSessionStore, type SessionStore } from "../persistence/session-store.js";
 import { createUserFactsStore, UserFactsStore } from "../persistence/user-facts-store.js";

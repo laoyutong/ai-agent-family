@@ -1,4 +1,3 @@
-import "./load-env.js";
 import { performance } from "node:perf_hooks";
 import { Client } from "@modelcontextprotocol/sdk/client";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";

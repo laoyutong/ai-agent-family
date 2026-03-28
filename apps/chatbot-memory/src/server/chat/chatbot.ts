@@ -1,24 +1,22 @@
-import "../config/load-env.js";
 import { loadMemoryChatbotBehaviorConfig, parseEnvBool } from "../config/chat-env.js";
-import type { SessionMemory } from "./chat-types.js";
 import { createCompleteNonStreaming, joinUrl } from "../llm/deepseek-client.js";
 import { parseSseDataLine } from "../llm/deepseek-sse.js";
-import { filterDialogueByEntropyPrinciple } from "./entropy-ppl-filter.js";
-import { createEnqueueFold, createMemoryFold } from "./memory-fold.js";
-import { popIncrementalSummaryBatch, totalTurnChars, trimTurnsIfOverLimit } from "./memory-turns.js";
 import { loadChatMcpPayloadLimits } from "../mcp/chat-mcp-limits.js";
 import {
   inferMcpRouteByHeuristic,
   shouldUseMcpSandboxForTurn,
   streamChatWithMcpTools,
 } from "../mcp/chat-mcp-tools.js";
-import { buildSystemContent } from "./system-content.js";
 import type { McpPool } from "../mcp/mcp.js";
 import type { SessionStore } from "../persistence/session-store.js";
-import { createAfterFoldUserFactsPromotion } from "./user-facts-promote.js";
 import type { UserFactsStore } from "../persistence/user-facts-store.js";
-import type { ChatStreamPart } from "../../shared/chat-stream.js";
-import { readUtf8Lines } from "../../shared/stream-read.js";
+import { readUtf8Lines, type ChatStreamPart } from "../shared/index.js";
+import type { SessionMemory } from "./chat-types.js";
+import { filterDialogueByEntropyPrinciple } from "./entropy-ppl-filter.js";
+import { createEnqueueFold, createMemoryFold } from "./memory-fold.js";
+import { popIncrementalSummaryBatch, totalTurnChars, trimTurnsIfOverLimit } from "./memory-turns.js";
+import { buildSystemContent } from "./system-content.js";
+import { createAfterFoldUserFactsPromotion } from "./user-facts-promote.js";
 
 const fallbackSessions = new Map<string, SessionMemory>();
 

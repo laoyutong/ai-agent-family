@@ -1,8 +1,10 @@
 import { squeezeMessagesForByteBudget, trimMessagesForByteBudget } from "../chat/chat-message-budget.js";
 import { parseEnvBool, parseIntEnv } from "../config/chat-env.js";
-import { loadChatMcpPayloadLimits, loadMcpCodeSandboxLimits, type ChatMcpPayloadLimits } from "./chat-mcp-limits.js";
 import { fetchChatCompletionNonStream, joinUrl } from "../llm/deepseek-client.js";
 import { parseSseDataLine } from "../llm/deepseek-sse.js";
+import { readUtf8Lines, type ChatStreamPart } from "../shared/index.js";
+import { truncateForLog } from "../util/log-preview.js";
+import { loadChatMcpPayloadLimits, loadMcpCodeSandboxLimits, type ChatMcpPayloadLimits } from "./chat-mcp-limits.js";
 import { logMcpSandboxCode, runMcpSandboxCode } from "./mcp-code-sandbox.js";
 import { buildMcpFacadeFromTools, extractFirstFencedCodeBlock } from "./mcp-facade-prompt.js";
 import type { McpPool } from "./mcp.js";
@@ -12,9 +14,6 @@ import {
   plannerSystemPrompt,
   type McpPlan,
 } from "./mcp-plan-execute.js";
-import type { ChatStreamPart } from "../../shared/chat-stream.js";
-import { readUtf8Lines } from "../../shared/stream-read.js";
-import { truncateForLog } from "../util/log-preview.js";
 
 export type { ChatMcpPayloadLimits };
 
