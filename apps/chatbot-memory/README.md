@@ -68,8 +68,8 @@ pnpm start
 | `CHAT_USER_FACTS_MAX_LINES` | 用户级事实最多保留行数（默认 `200`，超出保留末尾） |
 | `CHAT_USER_FACTS_PROMOTE_LLM` | 记忆折叠后是否再调模型筛出「可跨会话」要点写入用户级事实（默认 `false`，仅合并本会话 facts 新增行） |
 | `CHAT_USER_FACTS_PROMOTE_MODEL` | 上述筛选所用模型；未设置则用主对话 `DEEPSEEK_MODEL` |
-| `CHAT_MCP_SANDBOX_POOL_SIZE` | MCP 代码沙盒**子进程池**容量（默认 `4`）；成功执行后复用子进程以降低 fork 开销。`0` 表示每次执行新建子进程（旧行为）。详见 `docs/MCP-CLIENT.md` |
+| `CHAT_MCP_SANDBOX_POOL_SIZE` | MCP 代码沙盒**子进程池**容量（默认 `4`）；成功执行后复用子进程以降低 fork 开销。`0` 表示每次执行新建子进程（旧行为）。详见 [`docs/ARCHITECTURE.md`](./docs/ARCHITECTURE.md) |
 
 ## 文档
 
-架构分析、路线图与 MCP 工作流程见 [`docs/`](./docs/README.md)（含与实现对齐的迭代说明）。
+- **架构说明**（主流程与核心实现）：[`docs/ARCHITECTURE.md`](./docs/ARCHITECTURE.md)
