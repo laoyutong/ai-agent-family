@@ -32,7 +32,7 @@
 
 - **MCP Client**：Node 进程内的 `Client` 实例（每个已连接的服务器一个），负责协议层的 `listTools`、`callTool`。
 - **McpPool**：对多个 `Client` 的薄封装，用配置里的 `id` 区分「连到哪台 MCP」，供聊天与 HTTP 共用。
-- **大模型**：不直接连 MCP；通过 **在 system 中注入 `mcp` 门面说明**，让模型输出 **fenced 代码块**；默认由父进程 **`fork` 子进程**（`mcp-sandbox-child.ts` / `CHAT_MCP_SANDBOX_CHILD=1`）在隔离环境中用 **`node:vm`** 执行代码；`mcp.xxx` / `__call_mcp__` 经 **IPC** 由父进程映射为 **`McpPool.callTool`**。子进程继承的环境变量会 **剔除** `DEEPSEEK_*`、`MCP_SERVERS`、常见 `*_API_KEY` 等敏感键；详见 §7。
+- **大模型**：不直接连 MCP；通过 **在 system 中注入 `mcp` 门面说明**，让模型输出 **fenced 代码块**；默认由父进程 **`fork` 子进程**（`mcp-sandbox-child.ts` / `CHAT_MCP_SANDBOX_CHILD=1`）在隔离环境中用 **`node:vm`** 执行代码，并默认通过 **子进程池**（`CHAT_MCP_SANDBOX_POOL_SIZE`）复用进程；`mcp.xxx` / `__call_mcp__` 经 **IPC** 由父进程映射为 **`McpPool.callTool`**。子进程继承的环境变量会 **剔除** `DEEPSEEK_*`、`MCP_SERVERS`、常见 `*_API_KEY` 等敏感键；详见 §7。
 - **执行**：模型生成的代码在沙盒内运行；每次「工具调用」由拦截层映射到真实 MCP，**不再**使用 DeepSeek 的 `tools` / `tool_calls`。
 
 ---
@@ -98,15 +98,18 @@
 
 ### 4.1 何时走 MCP 工具链路
 
-在 `streamChat`（`chatbot.ts`）中，顺序如下（与「先组好 messages 再 listTools」的旧描述不同，已优化首字前等待）：
+在 `streamChat`（`chatbot.ts`）中，顺序如下（**熵过滤已改为回合结束后异步**，不再与 `listTools` 并行、也不阻塞首包）：
 
-1. **熵过滤与工具列表并行**：若开启熵过滤且本轮仍可能走 MCP，则 **`Promise.all`** 同时执行 `filterDialogueByEntropyPrinciple` 与 **`mcpPool.listTools()`**（后者在不需要 MCP 时可跳过，见下）。二者都完成后，再组装 `messages`（system + 过滤后的 turns + 当前 user）。
-2. **是否拉工具 / 是否走 MCP**（由环境变量与启发式共同决定）：
-   - **`CHAT_MCP_ROUTER_HEURISTIC`**（默认 `true`）：先对**原始用户输入**调用 **`inferMcpRouteByHeuristic`**。若判定为明显寒暄，可 **跳过** `listTools` 与后续 MCP，直接 DeepSeek 流式；若判定为明显需要工具/文件等，则 **跳过** 路由 LLM，直接进入 MCP 链路（仍需先 `listTools`，已与熵过滤并行完成）。
-   - **`CHAT_MCP_TURN_ROUTER`**（默认 `true`）：在启发式为「不明确」时，用非流式 **`shouldUseMcpSandboxForTurn`**（路由 LLM）判断本轮是否必须走沙盒；为 `false` 时只要 `listTools` 非空即走 MCP（旧行为）。路由 LLM 使用的是 **熵过滤之后** 的当前用户正文，与发给主对话的 `messages` 一致。
-3. 若 `mcpPool?.configured` 为真、`listed.length > 0` 且判定应走 MCP，则进入 **`streamChatWithMcpTools(…)`**，而不是直接纯流式 `fetch(…, stream: true)`。
-4. 若 `listTools` 失败或 MCP 路径抛错，会打日志并 **回退** 到无工具的流式对话。
-5. 若未配置 MCP 或工具列表为空，行为与原来一致：仅 DeepSeek 流式补全。
+1. **准备上下文片段**：`buildSystemContent`、当前 `session.turns`、本轮用户原文；**不**在首包前做同步熵过滤（`entropy_gate` 仅决定回合结束后是否异步压缩）。
+2. **`listTools`（若可能需要 MCP）**：`inferMcpRouteByHeuristic` 未把本轮判为「明显寒暄」且已配置 MCP 时，**`await mcpPool.listTools()`**（可命中 TTL 缓存）；不需要 MCP 时可跳过。
+3. **组装 `messages`**：`system` + **未熵过滤的 turns** + **本轮用户原文**（与随后 `fetch` / MCP 分支使用同一套 messages）。
+4. **是否走 MCP**（由环境变量与启发式共同决定）：
+   - **`CHAT_MCP_ROUTER_HEURISTIC`**（默认 `true`）：先对**原始用户输入**调用 **`inferMcpRouteByHeuristic`**。若判定为明显寒暄，可 **跳过** `listTools` 与后续 MCP，直接 DeepSeek 流式；若判定为明显需要工具/文件等，则 **跳过** 路由 LLM，直接进入 MCP 链路（仍需先 `listTools`）。
+   - **`CHAT_MCP_TURN_ROUTER`**（默认 `true`）：在启发式为「不明确」时，用非流式 **`shouldUseMcpSandboxForTurn`**（路由 LLM）判断本轮是否必须走沙盒；为 `false` 时只要 `listTools` 非空即走 MCP（旧行为）。路由 LLM 与主对话使用**同一**本轮用户正文（原文），与 `messages` 中最后一条 user 一致。
+5. **回合结束后（异步）**：若开启熵过滤且满足门槛，`scheduleEntropyCompressAfterTurn` 在 **`turns` 已写入本轮 user/assistant 之后** 异步压缩历史，供**下一轮**起生效（见 `entropy_filter_async_*` 日志）。
+6. 若 `mcpPool?.configured` 为真、`listed.length > 0` 且判定应走 MCP，则进入 **`streamChatWithMcpTools(…)`**，而不是直接纯流式 `fetch(…, stream: true)`。
+7. 若 `listTools` 失败或 MCP 路径抛错，会打日志并 **回退** 到无工具的流式对话。
+8. 若未配置 MCP 或工具列表为空，行为与原来一致：仅 DeepSeek 流式补全。
 
 会话记忆里仍只存 **user / assistant 文本**；代码执行与「【代码执行结果】」等中间消息只在**当轮**与模型的多轮往返中存在，**不**逐条写入 `turns`。
 
@@ -126,7 +129,7 @@
    - 模型输出须含 **一个** `javascript` / `typescript` fenced 代码块；解析后交给 `mcp-code-sandbox.ts`。
    - 若未找到代码块或沙盒执行未成功（且未超过**当前路径**下的轮次上限），在同一段 `messages` 中追加 **assistant + user（执行结果 + 重试说明）**，再请求模型**仅**输出修正后的代码块。
    - 若沙盒执行成功（`ok: true`），单段路径进入最终答复轮；多步路径则进入下一步或合并终答。
-7. **沙盒执行**（`mcp-code-sandbox.ts` + `mcp-sandbox-child.ts`）：默认 **每次执行 fork 一个子进程**，在子进程内创建 **`node:vm` 受限上下文**（仅暴露 `mcp`、`__call_mcp__`、受限 `console` 与安全内置）；MCP 实际调用在 **父进程** 完成并通过 IPC 回传。父进程侧 **`Promise` + 定时器** 控制**总执行时长**（`CHAT_MCP_CODE_MAX_MS`）；**每一次**子进程 vm 运行内 MCP 调用次数上限见 `CHAT_MCP_CODE_MAX_CALLS`（多步时**每一步**单独 fork，计数**每步重置**）。若设置 `CHAT_MCP_SANDBOX_IN_PROCESS=true`，则退回**同进程** vm（仅调试用，见 §7）。
+7. **沙盒执行**（`mcp-code-sandbox.ts` + `mcp-sandbox-child.ts`）：在子进程内创建 **`node:vm` 受限上下文**（仅暴露 `mcp`、`__call_mcp__`、受限 `console` 与安全内置）；MCP 实际调用在 **父进程** 完成并通过 IPC 回传。默认启用 **子进程池**（`CHAT_MCP_SANDBOX_POOL_SIZE`，默认 **4**）：成功执行完的子进程归还池中复用，失败/超时则杀掉并换新的；设为 **0** 则恢复为**每次执行 fork 新子进程**（与旧行为一致）。父进程侧 **`Promise` + 定时器** 控制**总执行时长**（`CHAT_MCP_CODE_MAX_MS`）；**每一轮** vm 执行内 MCP 调用次数上限见 `CHAT_MCP_CODE_MAX_CALLS`（多步时**每一步**一次沙盒会话，计数**每步重置**）。若设置 `CHAT_MCP_SANDBOX_IN_PROCESS=true`，则退回**同进程** vm（仅调试用，见 §7）。
 8. **最终答复轮**：流式 `chat/completions`；单段路径下会先 **`prepareMessagesForFinalReply`**，把「含代码的 assistant」换成占位说明，避免终答复述代码。将增量正文 **yield** 给前端。
 
 **分工**：**规划**与**每步代码**均由 **模型** 产出；是否在沙盒里执行、步骤间如何拼「观测」字符串、如何转发 MCP —— **本服务**。
@@ -137,15 +140,17 @@
 
 ```
 用户输入
-  → （可选）熵过滤 ∥ listTools() 并行
-  → 组装 messages（记忆 + 熵过滤结果）
-  → （可选）MCP 启发式 / 路由 LLM 决定是否走沙盒
+  →（可选）折叠归档节选注入 system
+  → 启发式 →（若可能走 MCP）listTools()（可缓存）
+  → 组装 messages（system + 未熵过滤的 turns + 本轮原文 user）
+  →（可选）MCP 路由 LLM 决定是否走沙盒
   → 若走 MCP：生成 mcp 门面文本 + system 说明（非 tools API）
   → （可选）非流式：先产出 json 步骤计划 → 按步重复：非流式 fenced 代码 → 子进程 vm 沙盒 →（IPC）父进程 callTool；步间附带「此前观测」
   → 或未规划：单段任务下非流式 fenced 代码 → 子进程 vm 沙盒 →（IPC）父进程 callTool
   → 必要时多轮「无代码 / 执行失败 → 重试仅输出代码块」（单段/分步各自有上限）
   → 流式：模型根据【代码执行结果】产出最终 assistant 正文
   → 写入 session.turns，摘要/裁切逻辑照旧
+  →（异步、不阻塞首包）回合结束后熵压缩历史，供下一轮使用
 ```
 
 ---

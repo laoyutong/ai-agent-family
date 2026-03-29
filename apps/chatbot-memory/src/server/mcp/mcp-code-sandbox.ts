@@ -4,7 +4,7 @@ import { fork, type ChildProcess } from "node:child_process";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import vm from "node:vm";
-import { parseEnvBool } from "../config/chat-env.js";
+import { parseEnvBool, parseIntEnv } from "../config/chat-env.js";
 import type { McpPool } from "./mcp.js";
 
 /** 子进程不应继承的敏感/可滥用环境变量名模式（仅块级删除键名，不记录值） */
@@ -110,6 +110,84 @@ function killChild(child: ChildProcess): void {
 }
 
 /**
+ * 复用 fork 子进程：限制同时占用数 ≤ max，空闲进程放回池中供下一次 `run`。
+ * `CHAT_MCP_SANDBOX_POOL_SIZE=0` 关闭池（每次执行仍 fork+结束即杀，与旧行为一致）。
+ */
+class SandboxChildPool {
+  private readonly max: number;
+  private readonly entry: string;
+  private readonly execArgv: string[];
+  private idle: ChildProcess[] = [];
+  private readonly busy = new Set<ChildProcess>();
+  private waiters: Array<() => void> = [];
+
+  constructor(max: number, entry: string, execArgv: string[]) {
+    this.max = max;
+    this.entry = entry;
+    this.execArgv = execArgv;
+  }
+
+  private spawn(): ChildProcess {
+    const child = fork(this.entry, [], {
+      execArgv: this.execArgv,
+      env: envForSandboxChild(),
+      stdio: ["ignore", "pipe", "pipe", "ipc"],
+    });
+    child.on("exit", () => {
+      this.busy.delete(child);
+      this.idle = this.idle.filter((c) => c !== child);
+      this.wakeOneWaiter();
+    });
+    return child;
+  }
+
+  private wakeOneWaiter(): void {
+    const w = this.waiters.shift();
+    if (w) w();
+  }
+
+  async acquire(): Promise<ChildProcess> {
+    for (;;) {
+      if (this.idle.length > 0) {
+        const c = this.idle.pop()!;
+        this.busy.add(c);
+        return c;
+      }
+      if (this.busy.size < this.max) {
+        const c = this.spawn();
+        this.busy.add(c);
+        return c;
+      }
+      await new Promise<void>((resolve) => {
+        this.waiters.push(resolve);
+      });
+    }
+  }
+
+  /** 成功执行完一轮且子进程仍健康时归还池中；否则杀掉子进程（异常/超时/执行失败）。 */
+  release(child: ChildProcess, healthy: boolean): void {
+    this.busy.delete(child);
+    if (healthy) {
+      this.idle.push(child);
+      this.wakeOneWaiter();
+    } else {
+      killChild(child);
+    }
+  }
+}
+
+let sandboxPool: SandboxChildPool | null = null;
+
+function getSandboxPool(entry: string, execArgv: string[]): SandboxChildPool | null {
+  const size = parseIntEnv("CHAT_MCP_SANDBOX_POOL_SIZE", 4);
+  if (size <= 0) return null;
+  if (!sandboxPool) {
+    sandboxPool = new SandboxChildPool(size, entry, execArgv);
+  }
+  return sandboxPool;
+}
+
+/**
  * 默认：在子进程中执行 vm（进程隔离 + 剥离敏感 env）；逃逸仅限子进程。
  * 设 `CHAT_MCP_SANDBOX_IN_PROCESS=true` 时回退为同进程 vm（不推荐，仅调试用）。
  */
@@ -117,34 +195,53 @@ export async function runMcpSandboxCode(opts: McpSandboxOptions): Promise<McpSan
   if (parseEnvBool("CHAT_MCP_SANDBOX_IN_PROCESS", false)) {
     return runMcpSandboxCodeInProcess(opts);
   }
-  return runMcpSandboxCodeInChildProcess(opts);
-}
-
-async function runMcpSandboxCodeInChildProcess(opts: McpSandboxOptions): Promise<McpSandboxResult> {
   const { entry, execArgv } = resolveSandboxChildEntry();
-  let callCount = 0;
-
+  const pool = getSandboxPool(entry, execArgv);
+  if (pool) {
+    const child = await pool.acquire();
+    return runOneSandboxSession(child, opts, (healthy) => pool!.release(child, healthy));
+  }
   const child = fork(entry, [], {
     execArgv,
     env: envForSandboxChild(),
     stdio: ["ignore", "pipe", "pipe", "ipc"],
   });
+  return runOneSandboxSession(child, opts, () => killChild(child));
+}
+
+/**
+ * 单次 user 代码执行：结束后调用 `onEnd(healthy)` — 池化时 healthy=true 归还子进程，否则销毁。
+ */
+function runOneSandboxSession(
+  child: ChildProcess,
+  opts: McpSandboxOptions,
+  onEnd: (healthy: boolean) => void,
+): Promise<McpSandboxResult> {
+  let callCount = 0;
 
   let stderrBuf = "";
   child.stderr?.setEncoding("utf8");
-  child.stderr?.on("data", (c: string) => {
+  const onStderr = (c: string) => {
     if (stderrBuf.length < 8000) stderrBuf += c;
-  });
+  };
+  child.stderr?.on("data", onStderr);
 
   return new Promise((resolve) => {
     let settled = false;
     let timer: ReturnType<typeof setTimeout>;
+    const detachRunListeners = () => {
+      child.off("message", onMessage);
+      child.off("error", onChildError);
+      child.off("exit", onChildExit);
+      child.stderr?.off("data", onStderr);
+    };
     const finish = (r: McpSandboxResult) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
-      child.removeAllListeners();
-      killChild(child);
+      detachRunListeners();
+      const healthy = r.ok === true && r.error === undefined;
+      onEnd(healthy);
       resolve(r);
     };
     timer = setTimeout(() => {
@@ -155,6 +252,28 @@ async function runMcpSandboxCodeInChildProcess(opts: McpSandboxOptions): Promise
         callCount,
       });
     }, opts.maxMs);
+
+    const onChildError = (err: Error) => {
+      finish({
+        ok: false,
+        error: err.message,
+        consoleLines: [],
+        callCount,
+      });
+    };
+
+    const onChildExit = (code: number | null, signal: NodeJS.Signals | null) => {
+      if (settled) return;
+      const hint = stderrBuf.trim().length > 0 ? ` 子进程 stderr: ${stderrBuf.trim()}` : "";
+      finish({
+        ok: false,
+        error: signal
+          ? `沙盒子进程被终止（${signal}）${hint}`
+          : `沙盒子进程异常退出（${code ?? "?"}）${hint}`,
+        consoleLines: [],
+        callCount,
+      });
+    };
 
     const onMessage = async (msg: unknown) => {
       if (!msg || typeof msg !== "object") return;
@@ -213,28 +332,8 @@ async function runMcpSandboxCodeInChildProcess(opts: McpSandboxOptions): Promise
     };
 
     child.on("message", onMessage);
-
-    child.on("error", (err) => {
-      finish({
-        ok: false,
-        error: err.message,
-        consoleLines: [],
-        callCount,
-      });
-    });
-
-    child.on("exit", (code, signal) => {
-      if (settled) return;
-      const hint = stderrBuf.trim().length > 0 ? ` 子进程 stderr: ${stderrBuf.trim()}` : "";
-      finish({
-        ok: false,
-        error: signal
-          ? `沙盒子进程被终止（${signal}）${hint}`
-          : `沙盒子进程异常退出（${code ?? "?"}）${hint}`,
-        consoleLines: [],
-        callCount,
-      });
-    });
+    child.on("error", onChildError);
+    child.on("exit", onChildExit);
 
     child.send({
       type: "run",

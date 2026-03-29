@@ -59,6 +59,7 @@ async function handleMessage(msg: unknown): Promise<void> {
   if (m.type !== "run") return;
 
   const run = m as RunMessage;
+  callSeq = 0;
   const consoleLines: string[] = [];
   const pushLog = (level: string, args: unknown[]) => {
     const parts = args.map((a) => {

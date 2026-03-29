@@ -1,6 +1,6 @@
 # chatbot-memory
 
-**知忆**：带**会话记忆**的聊天**网页应用**（浏览器 UI / Vite + Express API + LangChain / DeepSeek）。助手消息使用 **Markdown** 渲染（`marked` + `DOMPurify` 消毒）。
+**知忆**：带**会话记忆**的聊天**网页应用**（浏览器 UI / Vite + Express API + DeepSeek OpenAI 兼容接口）。助手消息使用 **Markdown** 渲染（`marked` + `DOMPurify` 消毒）。
 
 ## 准备
 
@@ -68,6 +68,7 @@ pnpm start
 | `CHAT_USER_FACTS_MAX_LINES` | 用户级事实最多保留行数（默认 `200`，超出保留末尾） |
 | `CHAT_USER_FACTS_PROMOTE_LLM` | 记忆折叠后是否再调模型筛出「可跨会话」要点写入用户级事实（默认 `false`，仅合并本会话 facts 新增行） |
 | `CHAT_USER_FACTS_PROMOTE_MODEL` | 上述筛选所用模型；未设置则用主对话 `DEEPSEEK_MODEL` |
+| `CHAT_MCP_SANDBOX_POOL_SIZE` | MCP 代码沙盒**子进程池**容量（默认 `4`）；成功执行后复用子进程以降低 fork 开销。`0` 表示每次执行新建子进程（旧行为）。详见 `docs/MCP-CLIENT.md` |
 
 ## 文档
 
