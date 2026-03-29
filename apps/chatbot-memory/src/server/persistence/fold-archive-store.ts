@@ -153,6 +153,35 @@ export class FoldArchiveStore {
     return { index: nextIndex, createdAt };
   }
 
+  /**
+   * 折叠模型失败时撤销本轮 `append`：从索引中移除条目并删除对应 JSON，避免「无 summary 关联」的孤岛归档。
+   */
+  async rollbackAppend(sessionId: string, index: number): Promise<void> {
+    if (!Number.isFinite(index) || index < 1) return;
+    const dir = archiveSessionDir(this.baseDir, sessionId);
+    const indexPath = path.join(dir, INDEX_FILE);
+    let indexDoc: IndexFileShape = { version: 1, entries: [] };
+    try {
+      const raw = await fs.readFile(indexPath, "utf8");
+      const parsed = JSON.parse(raw) as IndexFileShape;
+      if (parsed?.version === 1 && Array.isArray(parsed.entries)) {
+        indexDoc = parsed;
+      }
+    } catch {
+      return;
+    }
+    const nextEntries = indexDoc.entries.filter((e) => e.index !== index);
+    if (nextEntries.length === indexDoc.entries.length) return;
+    indexDoc = { ...indexDoc, entries: nextEntries };
+    await atomicWriteFile(indexPath, JSON.stringify(indexDoc, null, 0));
+    const recordPath = path.join(dir, `${Math.floor(index)}.json`);
+    try {
+      await fs.unlink(recordPath);
+    } catch {
+      /* */
+    }
+  }
+
   /** 折叠成功并写回会话后调用：把本轮合并后的 summary/facts 写入对应归档 JSON */
   async finalizeEntry(
     sessionId: string,

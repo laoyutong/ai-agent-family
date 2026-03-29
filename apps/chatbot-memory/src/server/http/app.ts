@@ -72,6 +72,11 @@ export async function createApiApp(): Promise<ApiAppResult> {
           });
         }
       : undefined,
+    onFoldArchiveRollback: foldArchiveStore
+      ? async ({ sessionId, ref }) => {
+          await foldArchiveStore.rollbackAppend(sessionId, ref.index);
+        }
+      : undefined,
   });
 
   const app = express();

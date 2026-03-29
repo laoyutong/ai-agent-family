@@ -334,6 +334,7 @@ export class SessionStore {
     delete m.summary;
     delete m.facts;
     delete m.foldArchiveLinks;
+    delete m.foldReinjectPrefixLen;
     m.foldChain = undefined;
     const meta = this.meta.get(id);
     if (meta) {

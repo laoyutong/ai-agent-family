@@ -2,6 +2,34 @@ import type { ChatMessage, SessionMemory } from "./chat-types.js";
 import type { CompleteNonStreaming } from "../llm/deepseek-client.js";
 import { formatTurnsForSummary } from "./memory-turns.js";
 
+const FOLD_MAX_ATTEMPTS = 3;
+const FOLD_RETRY_BASE_MS = 250;
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/** 折叠失败时把移出 `turns` 的批次按时间顺序写回（见 `foldReinjectPrefixLen`） */
+function reInjectDroppedIntoTurns(
+  session: SessionMemory,
+  mode: "incremental" | "trim",
+  dropped: ChatMessage[],
+): void {
+  if (dropped.length === 0) return;
+  if (mode === "incremental") {
+    session.turns = [...dropped, ...session.turns];
+    session.foldReinjectPrefixLen = dropped.length;
+    return;
+  }
+  const prefix = session.foldReinjectPrefixLen ?? 0;
+  if (prefix > 0) {
+    session.turns.splice(prefix, 0, ...dropped);
+  } else {
+    session.turns = [...dropped, ...session.turns];
+  }
+  delete session.foldReinjectPrefixLen;
+}
+
 /** 解析记忆分层模型返回的 JSON（可带 markdown 围栏），提取 summary / facts 字段 */
 function parseLayeredFoldOutput(text: string): { summary: string; facts: string } {
   const trimmed = text.trim();
@@ -127,6 +155,11 @@ export function createEnqueueFold(
       previousSummary: string | undefined;
       previousFacts: string | undefined;
     }) => void | Promise<void>;
+    /** 折叠在模型侧失败且已 `onArchiveDropped` 落盘时调用，用于撤销孤儿归档条目 */
+    onFoldArchiveRollback?: (params: {
+      sessionId: string;
+      ref: FoldArchiveEnqueueRef;
+    }) => void | Promise<void>;
   },
 ): (
   session: SessionMemory,
@@ -161,13 +194,26 @@ export function createEnqueueFold(
         const previousSummary = session.summary;
         const previousFacts = session.facts;
         try {
-          const { summary, facts } = await foldDroppedIntoLayers(
-            session.summary,
-            session.facts,
-            dropped,
-          );
+          let lastErr: unknown;
+          let merged: { summary: string; facts: string } | undefined;
+          for (let attempt = 1; attempt <= FOLD_MAX_ATTEMPTS; attempt++) {
+            try {
+              merged = await foldDroppedIntoLayers(session.summary, session.facts, dropped);
+              break;
+            } catch (e) {
+              lastErr = e;
+              if (attempt < FOLD_MAX_ATTEMPTS) {
+                await sleep(FOLD_RETRY_BASE_MS * attempt);
+              }
+            }
+          }
+          if (!merged) {
+            throw lastErr ?? new Error("fold failed: no result");
+          }
+          const { summary, facts } = merged;
           session.summary = summary.trim() || undefined;
           session.facts = facts.trim() || undefined;
+          delete session.foldReinjectPrefixLen;
           if (archiveRef && sid) {
             try {
               await options?.onFoldArchiveFinalized?.({
@@ -197,6 +243,14 @@ export function createEnqueueFold(
             mode === "incremental" ? "incremental summary fold failed:" : "chat history summarize failed:",
             e,
           );
+          if (archiveRef && sid) {
+            try {
+              await options?.onFoldArchiveRollback?.({ sessionId: sid, ref: archiveRef });
+            } catch (rbErr) {
+              console.error("[memory-fold] onFoldArchiveRollback 失败:", rbErr);
+            }
+          }
+          reInjectDroppedIntoTurns(session, mode, dropped);
         }
       })
       .finally(() => {

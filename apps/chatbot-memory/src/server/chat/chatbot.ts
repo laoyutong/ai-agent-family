@@ -88,6 +88,8 @@ export type MemoryChatbotOptions = {
     previousSummary: string | undefined;
     previousFacts: string | undefined;
   }) => void | Promise<void>;
+  /** 折叠失败且已写入归档时调用（如撤销孤儿归档条目） */
+  onFoldArchiveRollback?: (params: { sessionId: string; ref: FoldArchiveEnqueueRef }) => void | Promise<void>;
   /** 传入则每轮对话自动将 `foldArchiveLinks` 对应磁盘归档节选拼入 system（需与归档存储同时启用） */
   foldArchiveInjectStore?: FoldArchiveStore;
 };
@@ -129,6 +131,7 @@ export function createMemoryChatbot(options?: MemoryChatbotOptions) {
     onFoldSettled: sessionStore ? (id) => sessionStore.onFoldSettled(id) : undefined,
     onArchiveDropped: options?.onFoldDroppedArchive,
     onFoldArchiveFinalized: options?.onFoldArchiveFinalized,
+    onFoldArchiveRollback: options?.onFoldArchiveRollback,
     onAfterFold:
       userFactsStore &&
       createAfterFoldUserFactsPromotion({
@@ -467,6 +470,7 @@ export function createMemoryChatbot(options?: MemoryChatbotOptions) {
           delete s.summary;
           delete s.facts;
           delete s.foldArchiveLinks;
+          delete s.foldReinjectPrefixLen;
           s.foldChain = undefined;
         }
       }

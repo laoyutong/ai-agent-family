@@ -18,4 +18,9 @@ export type SessionMemory = {
   foldArchiveLinks?: FoldArchiveLink[];
   /** 后台摘要任务链，保证多轮裁切时按序合并进 summary/facts，避免并发写竞态 */
   foldChain?: Promise<void>;
+  /**
+   * 仅内存：增量折叠失败时回灌到 `turns` 队首的长度（条数），供后续 trim 折叠失败时把裁切批次插在正确位置。
+   * 不持久化。
+   */
+  foldReinjectPrefixLen?: number;
 };
