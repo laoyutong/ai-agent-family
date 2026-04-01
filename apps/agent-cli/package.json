@@ -1,0 +1,26 @@
+{
+  "name": "agent-cli",
+  "version": "0.0.0",
+  "private": true,
+  "description": "终端 AI 编程助手：受 Claude Code 架构启发，基于 DeepSeek API 的工具调用代理",
+  "type": "module",
+  "bin": {
+    "agent-cli": "./dist/main.js"
+  },
+  "scripts": {
+    "dev": "tsx src/main.ts",
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/main.js"
+  },
+  "dependencies": {
+    "chalk": "^5.4.1",
+    "dotenv": "^16.4.7",
+    "glob": "^11.0.1",
+    "zod": "^3.24.2"
+  },
+  "devDependencies": {
+    "@types/node": "^22.13.10",
+    "tsx": "^4.19.3",
+    "typescript": "^5.8.2"
+  }
+}
