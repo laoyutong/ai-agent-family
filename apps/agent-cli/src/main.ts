@@ -18,12 +18,8 @@ async function main(): Promise<void> {
     chatUrl,
     apiKey: config.apiKey,
     model: config.model,
+    cwd: config.cwd,
   };
-
-  console.log(
-    chalk.green("agent-cli"),
-    chalk.dim(`model=${config.model} cwd=${config.cwd}`),
-  );
 
   if (cli.prompt !== undefined) {
     const text = cli.prompt ?? "";
@@ -35,7 +31,6 @@ async function main(): Promise<void> {
     return;
   }
 
-  console.log(chalk.dim("交互模式 · DeepSeek 流式 · Ctrl+C 中断当前生成 · exit 退出"));
   await runRepl(llm);
 }
 

@@ -97,18 +97,20 @@ src/services/llm/
 
 ```
 src/ui/
-├── repl.ts              # readline 主循环：提示符 → 读输入 → 处理 → 显示
-├── spinner.ts           # 等待中的加载动画
-├── markdown-render.ts   # Markdown → 终端 ANSI 渲染（chalk 着色 + 代码高亮）
-└── theme.ts             # 颜色主题定义
+├── repl.tsx             # Ink render 入口（交互 / 单次模式）
+├── chat-app.tsx         # React+Ink 主界面：Static 历史、流式区、TextInput
+├── session-options.ts   # ReplOptions、system 预设、isAbortError
+├── spinner.ts           # （可选）独立 spinner；当前用 ink-spinner
+├── markdown-render.ts   # Markdown → 终端 ANSI（后续）
+└── theme.ts             # 颜色主题（后续）
 ```
 
 ### 关键设计
 
-- **不使用 Ink**（MVP 阶段）：Node.js 内置 `readline/promises` 足够，避免 React 渲染复杂度。Phase 11 可选迁移到 Ink。
-- **流式输出**：逐 chunk `process.stdout.write()`，结束后换行。
-- **中断**：`Ctrl+C` 取消当前生成（通过 AbortController），不退出程序。
-- **多行输入**：以 `\` 结尾的行自动续接下一行。
+- **Ink + React**：`<Static>` 累积对话历史，动态区展示流式回复与 `ink-text-input`；`maxFps`/`incrementalRendering` 减轻闪烁。
+- **流式输出**：`fetchStreaming` 增量更新 React state，带动 Ink 重绘。
+- **中断**：`Ctrl+C` —— 生成中 `AbortController.abort()`，空闲时 `exit()`；`render({ exitOnCtrlC: false })` 由应用接管。
+- **多行输入**：后续可用 `\` 续行或 TextArea 风格扩展（当前单行 + Enter）。
 
 ### 交付标准
 
@@ -602,8 +604,10 @@ apps/agent-cli/
     │   └── config.ts            # Phase 6
     │
     ├── ui/
-    │   ├── repl.ts              # Phase 2  REPL 主循环
-    │   ├── spinner.ts           # Phase 2  加载动画
+    │   ├── repl.tsx             # Phase 2  Ink 入口
+    │   ├── chat-app.tsx         # Phase 2  主界面
+    │   ├── session-options.ts  # Phase 2  会话类型
+    │   ├── spinner.ts           # Phase 2  加载动画（可选）
     │   ├── markdown-render.ts   # Phase 2  Markdown 渲染
     │   └── theme.ts             # Phase 2  颜色主题
     │

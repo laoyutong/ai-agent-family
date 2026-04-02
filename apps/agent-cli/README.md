@@ -79,6 +79,7 @@ pnpm --filter agent-cli build
 
 - **Runtime**: Node.js 20+
 - **Language**: TypeScript (strict)
+- **TUI**: React 19 + Ink 6（`ink-text-input`、`ink-spinner`）
 - **LLM**: DeepSeek OpenAI 兼容 API
 - **Schema**: Zod
 - **搜索**: ripgrep (rg)
