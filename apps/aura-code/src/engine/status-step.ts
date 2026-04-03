@@ -45,105 +45,88 @@ function toolLabel(name: string): string {
   return TOOL_LABEL[name] ?? name;
 }
 
-export function formatToolInvoke(tc: ToolCall): AgentStep {
+/** 一行内说明「对谁 / 做了什么」，与结果摘要拼接 */
+function shortToolContext(tc: ToolCall): string {
   const name = tc.function.name;
-  const label = toolLabel(name);
   const args = parseArgs(tc);
-
-  let detail: string | undefined;
   switch (name) {
-    case "run_command": {
-      detail = clipOneLine(argStr(args, "command"), 96);
-      break;
-    }
+    case "run_command":
+      return clipOneLine(argStr(args, "command"), 48);
     case "read_file": {
       const path = argStr(args, "path");
       const off = args.offset;
       const lim = args.limit;
       let extra = "";
       if (typeof off === "number" && typeof lim === "number") {
-        extra = ` · 行 ${off}–${off + lim - 1}`;
+        extra = ` L${off}-${off + lim - 1}`;
       } else if (typeof off === "number") {
-        extra = ` · 从行 ${off}`;
+        extra = ` L${off}+`;
       } else if (typeof lim === "number") {
-        extra = ` · 最多 ${lim} 行`;
+        extra = ` ≤${lim}行`;
       }
-      detail = clipOneLine(path + extra, 88);
-      break;
+      return clipOneLine(path + extra, 56);
     }
-    case "write_file": {
-      detail = clipOneLine(argStr(args, "path"), 72);
-      break;
-    }
-    case "search_replace": {
-      detail = clipOneLine(argStr(args, "path"), 72);
-      break;
-    }
+    case "write_file":
+    case "search_replace":
+      return clipOneLine(argStr(args, "path"), 44);
     case "glob_files": {
-      const pat = clipOneLine(argStr(args, "pattern"), 48);
+      const pat = clipOneLine(argStr(args, "pattern"), 36);
       const cwd = args.cwd ? argStr(args, "cwd") : "";
-      detail = cwd ? `${pat} · ${clipOneLine(cwd, 32)}` : pat;
-      break;
+      return cwd ? `${pat} @${clipOneLine(cwd, 20)}` : pat;
     }
     case "grep_content": {
-      const pat = clipOneLine(argStr(args, "pattern"), 40);
+      const pat = clipOneLine(argStr(args, "pattern"), 28);
       const p = args.path ? argStr(args, "path") : "";
-      const g = args.glob ? argStr(args, "glob") : "";
-      const bits = [pat];
-      if (p) bits.push(`@${clipOneLine(p, 28)}`);
-      if (g) bits.push(`(${clipOneLine(g, 20)})`);
-      detail = bits.join(" ");
-      break;
+      return p ? `${pat} @${clipOneLine(p, 20)}` : pat;
     }
     default:
-      detail = clipOneLine(tc.function.arguments || "", 64);
+      return clipOneLine(tc.function.arguments || "", 40);
   }
-
-  return {
-    tone: "invoke",
-    title: label,
-    detail: detail || undefined,
-  };
 }
 
-/** 根据工具输出缩为适合终端展示的摘要（正文仍完整发往模型） */
-export function formatToolResult(name: string, text: string): AgentStep {
-  const label = toolLabel(name);
+function summarizeToolOutput(name: string, text: string): string {
   const err = text.startsWith("错误：");
   const raw = text.trim();
-  let detail = "";
 
   if (name === "read_file" && !err) {
     const lines = raw.split("\n");
     const n = lines.length;
-    if (n <= 3) {
-      detail = lines.map((ln) => clipOneLine(ln, 100)).join(" · ");
-    } else {
-      const head = clipOneLine(lines[0] ?? "", 88);
-      detail = `${head} · … 共 ${n} 行`;
+    if (n <= 1) {
+      return clipOneLine(lines[0] ?? "(空)", 56);
     }
-  } else if (name === "glob_files" && !err) {
-    const ls = raw.split("\n").filter(Boolean);
-    const n = ls.length;
-    detail =
-      n === 0
-        ? "无匹配"
-        : n <= 2
-          ? ls.join(" · ")
-          : `${clipOneLine(ls[0] ?? "", 48)} 等 ${n} 条`;
-  } else if (name === "grep_content" && !err) {
-    const ls = raw.split("\n").filter(Boolean);
-    const n = ls.length;
-    detail =
-      n === 0
-        ? "无匹配"
-        : n === 1
-          ? clipOneLine(ls[0] ?? "", 100)
-          : `${clipOneLine(ls[0] ?? "", 72)} · … ${n} 处`;
-  } else {
-    detail = clipOneLine(raw.replace(/\n/g, " ↵ "), 120);
+    return `… ${n} 行`;
   }
+  if (name === "glob_files" && !err) {
+    const ls = raw.split("\n").filter(Boolean);
+    const n = ls.length;
+    if (n === 0) return "无匹配";
+    if (n === 1) return clipOneLine(ls[0] ?? "", 44);
+    return `${n} 条`;
+  }
+  if (name === "grep_content" && !err) {
+    const ls = raw.split("\n").filter(Boolean);
+    const n = ls.length;
+    if (n === 0) return "无匹配";
+    if (n === 1) return clipOneLine(ls[0] ?? "", 56);
+    return `${n} 处`;
+  }
+  if (name === "write_file" && !err) {
+    return clipOneLine(raw.replace(/\n/g, " "), 48);
+  }
+  if (name === "search_replace" && !err) {
+    return clipOneLine(raw.replace(/\n/g, " "), 48);
+  }
+  return clipOneLine(raw.replace(/\n/g, "↵"), 64);
+}
 
+/** 单条工具：调用参数 + 结果一条写完（替代原先的 invoke + result 两步） */
+export function formatToolOutcome(tc: ToolCall, text: string): AgentStep {
+  const name = tc.function.name;
+  const label = toolLabel(name);
+  const err = text.startsWith("错误：");
+  const ctx = shortToolContext(tc);
+  const sum = summarizeToolOutput(name, text);
+  const detail = ctx ? `${ctx} → ${sum}` : sum;
   return {
     tone: err ? "fail" : "done",
     title: label,

@@ -2,6 +2,7 @@ import React, {
   memo,
   useCallback,
   useEffect,
+  useMemo,
   useRef,
   useState,
 } from "react";
@@ -29,11 +30,37 @@ type TranscriptItem = {
   steps?: AgentStep[];
 };
 
+/** Ink 每棵树只保留一个 staticNode；首项为常驻顶栏，其后为已结束轮次 */
+type StaticFeedItem =
+  | { kind: "intro" }
+  | (TranscriptItem & { kind: "turn" });
+
 export type ChatAppProps = {
   mode: "repl" | "single";
   options: ReplOptions;
   singlePrompt?: string;
 };
+
+/** 助手消息里「工具 / 轮次」区块：与正文分区，避免 Ink 换行时视觉上糊在一起 */
+const AssistantStepsBlock = memo(function AssistantStepsBlock(props: {
+  steps: AgentStep[];
+  heading: string;
+}): React.JSX.Element {
+  return (
+    <Box
+      flexDirection="column"
+      marginBottom={1}
+      paddingLeft={1}
+      paddingY={0}
+      borderLeft
+      borderStyle="single"
+      borderDimColor
+      borderLeftColor={theme.hint}
+    >
+      <AgentStepList steps={props.steps} heading={props.heading} compact />
+    </Box>
+  );
+});
 
 const MessageCard = memo(function MessageCard(props: {
   role: "user" | "assistant";
@@ -62,7 +89,7 @@ const MessageCard = memo(function MessageCard(props: {
           {label}
         </Text>
       </Box>
-      <Box paddingTop={0}>
+      <Box flexDirection="column" paddingTop={0} width="100%">
         {props.children}
       </Box>
     </Box>
@@ -92,26 +119,36 @@ const AgentStepList = memo(function AgentStepList({
 }: {
   steps: AgentStep[];
   heading: string;
-  /** 为 true 时不留列表底部外边距（嵌入「进行中」面板时用） */
+  /** 为 true 时不留列表底部外边距（外层分区 Box 已负责与正文的间距） */
   compact?: boolean;
 }): React.JSX.Element {
   return (
-    <Box flexDirection="column" marginBottom={compact ? 0 : 1}>
-      <Text bold color={theme.hint}>
-        {heading}
-      </Text>
+    <Box flexDirection="column" marginBottom={compact ? 0 : 1} width="100%">
+      <Box marginBottom={1}>
+        <Text bold color={theme.hint}>
+          {heading}
+        </Text>
+      </Box>
       {steps.map((step, i) => {
         const { glyph, color } = stepToneStyle(step.tone);
         const n = `${i + 1}.`;
         return (
-          <Box key={i} flexDirection="column">
-            <Text wrap="wrap">
-              <Text dimColor>{n} </Text>
-              <Text color={color} bold={step.tone === "round"}>
-                {glyph}
-                {step.title}
-              </Text>
-            </Text>
+          <Box key={i} flexDirection="column" marginTop={0}>
+            <Box flexDirection="row" alignItems="flex-start">
+              <Box flexShrink={0}>
+                <Text dimColor>{n} </Text>
+              </Box>
+              <Box flexGrow={1} flexShrink={1}>
+                <Text
+                  wrap="wrap"
+                  color={color}
+                  bold={step.tone === "round"}
+                >
+                  {glyph}
+                  {step.title}
+                </Text>
+              </Box>
+            </Box>
             {step.detail ? (
               <Box paddingLeft={n.length + 1}>
                 <Text dimColor wrap="wrap">
@@ -123,32 +160,6 @@ const AgentStepList = memo(function AgentStepList({
         );
       })}
     </Box>
-  );
-});
-
-/** 已结束的轮次写入 Static，避免整段对话都算进 Ink 动态高度，触发清屏/全屏分支来回切换 */
-const Transcript = memo(function Transcript({
-  items,
-}: {
-  items: TranscriptItem[];
-}): React.JSX.Element {
-  return (
-    <Static items={items}>
-      {(row) =>
-        row.role === "user" ? (
-          <MessageCard key={row.id} role="user">
-            <Text wrap="wrap">{row.text}</Text>
-          </MessageCard>
-        ) : (
-          <MessageCard key={row.id} role="assistant">
-            {row.steps && row.steps.length > 0 ? (
-              <AgentStepList steps={row.steps} heading="步骤" />
-            ) : null}
-            <Text wrap="wrap">{row.text}</Text>
-          </MessageCard>
-        )
-      }
-    </Static>
   );
 });
 
@@ -299,53 +310,85 @@ export function ChatApp({
     handleSubmitLineRef.current(line);
   }, []);
 
+  const staticFeed = useMemo((): StaticFeedItem[] => {
+    return [
+      { kind: "intro" },
+      ...items.map((row) => ({ kind: "turn" as const, ...row })),
+    ];
+  }, [items]);
+
   return (
-    <Box flexDirection="column" paddingX={1} gap={0}>
-      <MemoInfoPanel model={options.model} cwd={cwd} />
+    <Box flexDirection="column" paddingX={1} gap={0} width="100%">
+      <Static items={staticFeed}>
+        {(row) =>
+          row.kind === "intro" ? (
+            <MemoInfoPanel key="__info__" model={options.model} cwd={cwd} />
+          ) : row.role === "user" ? (
+            <MessageCard key={row.id} role="user">
+              <Text wrap="wrap">{row.text}</Text>
+            </MessageCard>
+          ) : (
+            <MessageCard key={row.id} role="assistant">
+              <Box flexDirection="column" width="100%">
+                {row.steps && row.steps.length > 0 ? (
+                  <AssistantStepsBlock
+                    steps={row.steps}
+                    heading="执行步骤"
+                  />
+                ) : null}
+                <Box flexDirection="column">
+                  {row.steps && row.steps.length > 0 ? (
+                    <Text dimColor bold>
+                      回复
+                    </Text>
+                  ) : null}
+                  <Text wrap="wrap">{row.text}</Text>
+                </Box>
+              </Box>
+            </MessageCard>
+          )
+        }
+      </Static>
 
-      <Transcript items={items} />
-
-      {busy && stepLog.length > 0 ? (
-        <Box
-          flexDirection="column"
-          marginBottom={0}
-          paddingLeft={1}
-          borderStyle="single"
-          borderColor={theme.border}
-          borderDimColor
-        >
-          <AgentStepList steps={stepLog} heading="进行中" compact />
-        </Box>
-      ) : null}
-
-      {busy && streamText.length > 0 ? (
+      {busy ? (
         <MessageCard role="assistant">
-          <Text wrap="wrap">
-            {streamText}
-            <Text color={theme.hint}>▍</Text>
-          </Text>
+          <Box flexDirection="column" width="100%">
+            {stepLog.length > 0 ? (
+              <AssistantStepsBlock steps={stepLog} heading="进行中" />
+            ) : null}
+            {streamText.length > 0 ? (
+              <Box flexDirection="column" width="100%">
+                {stepLog.length > 0 ? (
+                  <Text dimColor bold>
+                    生成中
+                  </Text>
+                ) : null}
+                {/*
+                  勿在 <Text wrap> 内嵌套带样式的子 <Text>：Ink squash/wrap 与 log-update
+                  擦行在流式结束、转入 Static 时易错位。
+                */}
+                <Box flexDirection="row" alignItems="flex-start" width="100%">
+                  <Box flexGrow={1} flexShrink={1}>
+                    <Text wrap="wrap">{streamText}</Text>
+                  </Box>
+                  <Box flexShrink={0}>
+                    <Text color={theme.hint}>▍</Text>
+                  </Box>
+                </Box>
+              </Box>
+            ) : (
+              <Box flexDirection="row" flexWrap="wrap" alignItems="center">
+                <Text color={theme.assistant}>
+                  <Spinner type="dots" />
+                </Text>
+                <Text color={theme.hint} wrap="wrap">
+                  {" "}
+                  {phaseHint || "处理中…"}
+                </Text>
+              </Box>
+            )}
+          </Box>
         </MessageCard>
-      ) : null}
-
-      {busy && streamText.length === 0 ? (
-        <Box
-          paddingX={1}
-          paddingY={0}
-          marginBottom={0}
-          borderStyle="round"
-          borderColor={theme.border}
-          borderDimColor
-          flexDirection="row"
-          flexWrap="wrap"
-        >
-          <Text color={theme.assistant}>
-            <Spinner type="dots" />
-          </Text>
-          <Text color={theme.hint} wrap="wrap">
-            {" "}
-            {phaseHint || "处理中…"}
-          </Text>
-        </Box>
       ) : null}
 
       {errorBanner ? (

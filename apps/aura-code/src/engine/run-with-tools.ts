@@ -9,11 +9,7 @@ import {
   getDefaultTools,
   MAX_TOOL_ROUNDS,
 } from "../tools/registry.js";
-import {
-  formatToolInvoke,
-  formatToolResult,
-  type RunStatusUpdate,
-} from "./status-step.js";
+import { formatToolOutcome, type RunStatusUpdate } from "./status-step.js";
 
 export type { AgentStep, RunStatusUpdate } from "./status-step.js";
 
@@ -54,11 +50,7 @@ export async function runWithTools(
     opts.onStreamReset?.();
     opts.onStatus?.({
       spinnerHint: `第 ${round + 1} 轮 · 请求模型`,
-      step: {
-        tone: "round",
-        title: `第 ${round + 1} 轮`,
-        detail: "请求模型…",
-      },
+      step: { tone: "round", title: `· 第 ${round + 1} 轮` },
     });
 
     let streamed = await streamChatCompletionRound({
@@ -81,13 +73,7 @@ export async function runWithTools(
       (!calls || calls.length === 0)
     ) {
       opts.onStreamReset?.();
-      opts.onStatus?.({
-        spinnerHint: "流式工具结构不完整 · 非流式补全",
-        step: {
-          tone: "note",
-          title: "流式响应未带回工具 JSON，已改用非流式请求",
-        },
-      });
+      opts.onStatus?.({ spinnerHint: "流式工具结构不完整 · 非流式补全" });
       const fb = await fetchNonStreaming({
         chatUrl: opts.chatUrl,
         apiKey: opts.apiKey,
@@ -113,13 +99,6 @@ export async function runWithTools(
           calls.length === 1
             ? `执行工具 · ${calls[0]!.function.name}`
             : `并行执行 ${calls.length} 个工具`,
-        step: {
-          tone: "note",
-          title:
-            calls.length === 1
-              ? `调用 1 个工具`
-              : `并行调用 ${calls.length} 个工具`,
-        },
       });
 
       opts.messages.push({
@@ -128,15 +107,9 @@ export async function runWithTools(
         tool_calls: calls,
       });
 
-      for (const tc of calls) {
-        opts.onStatus?.({
-          spinnerHint: `${tc.function.name} · 运行`,
-          step: formatToolInvoke(tc),
-        });
-      }
-
       const pairs = await Promise.all(
         calls.map(async (tc) => {
+          opts.onStatus?.({ spinnerHint: `${tc.function.name} · 运行` });
           const out = await executeToolCall(tc, opts.cwd, opts.signal);
           return { tc, out };
         }),
@@ -150,16 +123,10 @@ export async function runWithTools(
         });
         opts.onStatus?.({
           spinnerHint: `${tc.function.name} · ${out.trimStart().startsWith("错误：") ? "失败" : "完成"}`,
-          step: formatToolResult(tc.function.name, out),
+          step: formatToolOutcome(tc, out),
         });
       }
-      opts.onStatus?.({
-        spinnerHint: "工具已完成 · 请求模型",
-        step: {
-          tone: "note",
-          title: "已注入工具结果，继续请求模型",
-        },
-      });
+      opts.onStatus?.({ spinnerHint: "工具已完成 · 请求模型" });
       continue;
     }
 
