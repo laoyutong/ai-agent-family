@@ -1,11 +1,11 @@
 {
-  "name": "agent-cli",
+  "name": "aura-code",
   "version": "0.0.0",
   "private": true,
-  "description": "终端 AI 编程助手：受 Claude Code 架构启发，基于 DeepSeek API 的工具调用代理",
+  "description": "光环代码：终端 AI 编程助手，受 Claude Code 架构启发，基于 DeepSeek API 的工具调用代理",
   "type": "module",
   "bin": {
-    "agent-cli": "./dist/main.js"
+    "aura-code": "./dist/main.js"
   },
   "scripts": {
     "dev": "tsx src/main.ts",

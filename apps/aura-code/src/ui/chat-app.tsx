@@ -24,6 +24,8 @@ type TranscriptItem = {
   id: string;
   role: "user" | "assistant";
   text: string;
+  /** 该条助手回复对应的模型/工具步骤（追加记录，不覆盖） */
+  steps?: string[];
 };
 
 export type ChatAppProps = {
@@ -66,6 +68,25 @@ const MessageCard = memo(function MessageCard(props: {
   );
 });
 
+const StepLines = memo(function StepLines({
+  lines,
+}: {
+  lines: string[];
+}): React.JSX.Element {
+  return (
+    <Box flexDirection="column" marginBottom={1}>
+      <Text bold color={theme.hint}>
+        步骤
+      </Text>
+      {lines.map((line, i) => (
+        <Text key={`${i}\0${line}`} color={theme.hint} wrap="wrap">
+          {i + 1}. {line}
+        </Text>
+      ))}
+    </Box>
+  );
+});
+
 const Transcript = memo(function Transcript({
   items,
 }: {
@@ -80,6 +101,9 @@ const Transcript = memo(function Transcript({
           </MessageCard>
         ) : (
           <MessageCard key={row.id} role="assistant">
+            {row.steps && row.steps.length > 0 ? (
+              <StepLines lines={row.steps} />
+            ) : null}
             <Text wrap="wrap">{row.text}</Text>
           </MessageCard>
         ),
@@ -104,8 +128,11 @@ export function ChatApp({
   const [streamText, setStreamText] = useState("");
   /** 进行中时 Spinner 旁的简短说明（不含工具全文） */
   const [phaseHint, setPhaseHint] = useState("处理中…");
+  /** 本轮从「请求模型 / 工具调用」到结束的步骤记录，追加写入、不覆盖 */
+  const [stepLog, setStepLog] = useState<string[]>([]);
   const [errorBanner, setErrorBanner] = useState<string | null>(null);
   const abortRef = useRef<AbortController | null>(null);
+  const stepLogRef = useRef<string[]>([]);
   const idSeq = useRef(0);
   const startedSingle = useRef(false);
 
@@ -125,6 +152,8 @@ export function ChatApp({
       ]);
       setBusy(true);
       setStreamText("");
+      stepLogRef.current = [];
+      setStepLog([]);
       setPhaseHint("处理中…");
       const ac = new AbortController();
       abortRef.current = ac;
@@ -139,6 +168,8 @@ export function ChatApp({
           signal: ac.signal,
           onStatus: (hint) => {
             setPhaseHint(hint);
+            stepLogRef.current.push(hint);
+            setStepLog([...stepLogRef.current]);
           },
           onStreamReset: () => {
             setStreamText("");
@@ -147,9 +178,15 @@ export function ChatApp({
             setStreamText((prev) => prev + chunk);
           },
         });
+        const steps = [...stepLogRef.current];
         setItems((prev) => [
           ...prev,
-          { id: nextId(), role: "assistant", text: assistantText },
+          {
+            id: nextId(),
+            role: "assistant",
+            text: assistantText,
+            steps: steps.length > 0 ? steps : undefined,
+          },
         ]);
         // 轮次耗尽等：assistant 气泡已与 error 全文一致，不再叠一条红色框避免重复
         if (error && error.trim() !== assistantText.trim()) {
@@ -166,6 +203,8 @@ export function ChatApp({
         setBusy(false);
         setPhaseHint("");
         setStreamText("");
+        stepLogRef.current = [];
+        setStepLog([]);
       }
     },
     [options.apiKey, options.chatUrl, options.model, cwd],
@@ -223,6 +262,26 @@ export function ChatApp({
       <MemoInfoPanel model={options.model} cwd={cwd} />
 
       <Transcript items={items} />
+
+      {busy && stepLog.length > 0 ? (
+        <Box
+          flexDirection="column"
+          marginBottom={0}
+          paddingLeft={1}
+          borderStyle="single"
+          borderColor={theme.border}
+          borderDimColor
+        >
+          <Text bold color={theme.hint}>
+            步骤
+          </Text>
+          {stepLog.map((line, i) => (
+            <Text key={`${i}\0${line}`} color={theme.hint} wrap="wrap">
+              {i + 1}. {line}
+            </Text>
+          ))}
+        </Box>
+      ) : null}
 
       {busy && streamText.length > 0 ? (
         <MessageCard role="assistant">

@@ -52,7 +52,7 @@ export async function runWithTools(
   for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
     opts.signal.throwIfAborted();
     opts.onStreamReset?.();
-    opts.onStatus?.("正在请求模型…");
+    opts.onStatus?.(`第 ${round + 1} 轮：正在请求模型…`);
 
     let streamed = await streamChatCompletionRound({
       chatUrl: opts.chatUrl,
@@ -74,7 +74,9 @@ export async function runWithTools(
       (!calls || calls.length === 0)
     ) {
       opts.onStreamReset?.();
-      opts.onStatus?.("流式未返回工具结构，改用非流式补全…");
+      opts.onStatus?.(
+        `第 ${round + 1} 轮：流式未返回工具结构，改用非流式补全…`,
+      );
       const fb = await fetchNonStreaming({
         chatUrl: opts.chatUrl,
         apiKey: opts.apiKey,
@@ -97,7 +99,7 @@ export async function runWithTools(
       opts.onStreamReset?.();
       const names = calls.map((c) => c.function.name);
       opts.onStatus?.(
-        `调用工具 (${calls.length}): ${shortenToolList(names)}`,
+        `第 ${round + 1} 轮：调用工具 (${calls.length})：${shortenToolList(names)}`,
       );
 
       opts.messages.push({
@@ -120,7 +122,7 @@ export async function runWithTools(
           content: out,
         });
       }
-      opts.onStatus?.("已收到工具结果，继续请求模型…");
+      opts.onStatus?.(`第 ${round + 1} 轮：已收到工具结果，继续请求模型…`);
       continue;
     }
 

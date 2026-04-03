@@ -6,7 +6,7 @@ import { runReadFile } from "./read-file.js";
 import { runSearchReplace } from "./search-replace.js";
 import { runWriteFile } from "./write-file.js";
 
-export const MAX_TOOL_ROUNDS = 24;
+export const MAX_TOOL_ROUNDS = 64;
 
 export function getDefaultTools(): OpenAITool[] {
   return [

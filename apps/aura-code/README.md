@@ -1,6 +1,6 @@
-# agent-cli
+# aura-code
 
-终端 AI 编程助手 — 受 [Claude Code](https://github.com/laoyutong/claude-code) 架构启发，基于 DeepSeek API 构建。
+光环代码：终端 AI 编程助手 — 受 [Claude Code](https://github.com/laoyutong/claude-code) 架构启发，基于 DeepSeek API 构建。
 
 ## 定位
 
@@ -22,10 +22,10 @@ pnpm install
 cp .env.example .env
 
 # 开发模式启动
-pnpm --filter agent-cli dev
+pnpm --filter aura-code dev
 
 # 构建
-pnpm --filter agent-cli build
+pnpm --filter aura-code build
 ```
 
 ## 核心架构

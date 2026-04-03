@@ -30,14 +30,11 @@ export function InfoPanel({ model, cwd }: InfoPanelProps): React.JSX.Element {
         <Box flexDirection="row" flexWrap="wrap">
           <Text dimColor>CLI </Text>
           <Text bold color={theme.title}>
-            agent
+            Aura
           </Text>
+          <Text> </Text>
           <Text bold color={theme.brand}>
-            -cli
-          </Text>
-          <Text dimColor> · </Text>
-          <Text dimColor italic>
-            assistant
+            Code
           </Text>
           <Text dimColor> · </Text>
           <Text dimColor>模型 </Text>

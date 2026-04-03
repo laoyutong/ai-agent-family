@@ -15,8 +15,8 @@ function readVersion(): string {
 export function parseCli(argv: string[]): CliOptions {
   const program = new Command();
   program
-    .name("agent-cli")
-    .description("终端 AI 编程助手（DeepSeek API）")
+    .name("aura-code")
+    .description("光环代码：终端 AI 编程助手（DeepSeek API）")
     .version(readVersion(), "-V, --version")
     .option(
       "-m, --model <id>",

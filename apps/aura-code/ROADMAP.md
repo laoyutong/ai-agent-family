@@ -1,6 +1,6 @@
-# agent-cli 实现路线图
+# aura-code 实现路线图
 
-> 受 [Claude Code 架构](https://github.com/laoyutong/claude-code) 启发，基于 DeepSeek API 构建的终端 AI 编程助手。
+> 光环代码：受 [Claude Code 架构](https://github.com/laoyutong/claude-code) 启发，基于 DeepSeek API 构建的终端 AI 编程助手。
 > 以下路线图按**阶段递进**组织，每个 Phase 可独立交付、可运行。
 
 ---
@@ -9,7 +9,7 @@
 
 下表列出 Claude Code 的核心子系统，以及本项目对应的模块与实现阶段。
 
-| Claude Code 子系统 | 规模 | agent-cli 对应模块 | Phase |
+| Claude Code 子系统 | 规模 | aura-code 对应模块 | Phase |
 |---|---|---|---|
 | `main.tsx` 入口 + Commander.js CLI | ~1 文件 | `src/main.ts` + `src/cli.ts` | 0 |
 | `QueryEngine.ts` LLM 查询引擎 | ~46K 行 | `src/services/llm/` | 1 |
@@ -48,7 +48,7 @@ src/
 
 ### 交付标准
 
-- [x] `pnpm --filter agent-cli dev` 可启动
+- [x] `pnpm --filter aura-code dev` 可启动
 - [ ] 无 API key 时输出友好错误提示并退出
 - [ ] `--help` 打印用法说明
 - [ ] `--version` 打印版本号
@@ -261,7 +261,7 @@ src/engine/
 | `default` | 按工具等级逐次审批 |
 | `yolo` | 跳过所有审批（`--yolo` 启动参数） |
 | `plan` | 只读模式，拒绝所有 cautious/dangerous 工具 |
-| `allowlist` | `.agent-cli/permissions.json` 白名单，匹配则自动放行 |
+| `allowlist` | `.aura-code/permissions.json` 白名单，匹配则自动放行 |
 
 ### 交付标准
 
@@ -318,7 +318,7 @@ interface Command {
 
 ```
 src/services/memory/
-├── session-store.ts     # 会话持久化（JSON 文件，~/.agent-cli/sessions/）
+├── session-store.ts     # 会话持久化（JSON 文件，~/.aura-code/sessions/）
 ├── context-builder.ts   # System prompt 组装：系统信息 + 项目上下文 + 记忆摘要
 ├── compactor.ts         # 上下文压缩：超过 token 上限时 LLM 摘要旧对话
 └── project-context.ts   # 自动收集项目信息：README, package.json, git info, 目录结构
@@ -342,7 +342,7 @@ src/services/memory/
 
 ### 7.2 会话恢复
 
-- 会话以 JSON 文件存储在 `~/.agent-cli/sessions/<id>.json`
+- 会话以 JSON 文件存储在 `~/.aura-code/sessions/<id>.json`
 - 启动时 `--resume` 或 `/resume` 恢复上次会话
 - 会话列表：`--list-sessions`
 
@@ -374,7 +374,7 @@ src/services/
 | 数据来源 | 解析每次 LLM 响应的 `usage` 字段 |
 | 费率 | 可配置 `COST_PER_1K_INPUT` / `COST_PER_1K_OUTPUT`，默认 DeepSeek 价格 |
 | 显示 | 每次回复结束后在右下角浅色显示 token 数；`/cost` 显示详情 |
-| 持久化 | 可选写入 `~/.agent-cli/usage.json`，按日汇总 |
+| 持久化 | 可选写入 `~/.aura-code/usage.json`，按日汇总 |
 
 ### 交付标准
 
@@ -394,7 +394,7 @@ src/services/mcp/
 ├── mcp-pool.ts          # MCP 连接池：管理多个 MCP server 连接
 ├── mcp-discovery.ts     # 工具发现：listTools() + 缓存
 ├── mcp-tool-adapter.ts  # 将 MCP tool 适配为 ToolDefinition 注册到 ToolRegistry
-└── mcp-config.ts        # MCP 配置文件解析（~/.agent-cli/mcp.json）
+└── mcp-config.ts        # MCP 配置文件解析（~/.aura-code/mcp.json）
 ```
 
 ### 配置格式
@@ -469,7 +469,7 @@ src/engine/
 
 ```
 src/plugins/
-├── loader.ts            # 插件加载器：扫描 ~/.agent-cli/plugins/ 目录
+├── loader.ts            # 插件加载器：扫描 ~/.aura-code/plugins/ 目录
 ├── plugin.ts            # Plugin 接口定义
 └── builtin/             # 内置插件
 ```
@@ -486,7 +486,7 @@ src/skills/
 ```
 
 - Skill = 可复用的 prompt 模板 + 工作流描述
-- 用户可在 `~/.agent-cli/skills/` 创建自定义 skill
+- 用户可在 `~/.aura-code/skills/` 创建自定义 skill
 
 ### 11.3 IDE Bridge
 
@@ -540,7 +540,7 @@ src/bridge/
 ## 目录结构全览（最终形态）
 
 ```
-apps/agent-cli/
+apps/aura-code/
 ├── package.json
 ├── tsconfig.json
 ├── README.md
@@ -634,7 +634,7 @@ apps/agent-cli/
 
 ## 与 Claude Code 架构的取舍说明
 
-| Claude Code 设计 | agent-cli 取舍 | 原因 |
+| Claude Code 设计 | aura-code 取舍 | 原因 |
 |---|---|---|
 | Bun runtime | Node.js | monorepo 已用 Node；Bun 可后期评估 |
 | React + Ink UI (140 组件) | readline → 后期 Ink | MVP 不需要复杂 UI；降低启动成本 |
