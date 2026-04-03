@@ -5,10 +5,11 @@ import React, {
   useRef,
   useState,
 } from "react";
-import { Box, Text, useApp, useInput } from "ink";
+import { Box, Static, Text, useApp, useInput } from "ink";
 import Spinner from "ink-spinner";
 import type { ChatMessage } from "../services/llm/types.js";
 import { runWithTools } from "../engine/run-with-tools.js";
+import type { AgentStep } from "../engine/status-step.js";
 import {
   buildAgentSystem,
   isAbortError,
@@ -25,7 +26,7 @@ type TranscriptItem = {
   role: "user" | "assistant";
   text: string;
   /** 该条助手回复对应的模型/工具步骤（追加记录，不覆盖） */
-  steps?: string[];
+  steps?: AgentStep[];
 };
 
 export type ChatAppProps = {
@@ -68,33 +69,72 @@ const MessageCard = memo(function MessageCard(props: {
   );
 });
 
-const StepLines = memo(function StepLines({
-  lines,
+function stepToneStyle(tone: AgentStep["tone"]) {
+  switch (tone) {
+    case "invoke":
+      return { glyph: "▸ ", color: theme.user };
+    case "done":
+      return { glyph: "✓ ", color: theme.assistant };
+    case "fail":
+      return { glyph: "✗ ", color: theme.error };
+    case "round":
+      return { glyph: "", color: theme.userMuted };
+    case "note":
+    default:
+      return { glyph: "· ", color: theme.hint };
+  }
+}
+
+const AgentStepList = memo(function AgentStepList({
+  steps,
+  heading,
+  compact = false,
 }: {
-  lines: string[];
+  steps: AgentStep[];
+  heading: string;
+  /** 为 true 时不留列表底部外边距（嵌入「进行中」面板时用） */
+  compact?: boolean;
 }): React.JSX.Element {
   return (
-    <Box flexDirection="column" marginBottom={1}>
+    <Box flexDirection="column" marginBottom={compact ? 0 : 1}>
       <Text bold color={theme.hint}>
-        步骤
+        {heading}
       </Text>
-      {lines.map((line, i) => (
-        <Text key={`${i}\0${line}`} color={theme.hint} wrap="wrap">
-          {i + 1}. {line}
-        </Text>
-      ))}
+      {steps.map((step, i) => {
+        const { glyph, color } = stepToneStyle(step.tone);
+        const n = `${i + 1}.`;
+        return (
+          <Box key={i} flexDirection="column">
+            <Text wrap="wrap">
+              <Text dimColor>{n} </Text>
+              <Text color={color} bold={step.tone === "round"}>
+                {glyph}
+                {step.title}
+              </Text>
+            </Text>
+            {step.detail ? (
+              <Box paddingLeft={n.length + 1}>
+                <Text dimColor wrap="wrap">
+                  {step.detail}
+                </Text>
+              </Box>
+            ) : null}
+          </Box>
+        );
+      })}
     </Box>
   );
 });
 
+/** 已结束的轮次写入 Static，避免整段对话都算进 Ink 动态高度，触发清屏/全屏分支来回切换 */
 const Transcript = memo(function Transcript({
   items,
 }: {
   items: TranscriptItem[];
 }): React.JSX.Element {
   return (
-    <Box flexDirection="column">
-      {items.map((row) =>
+    <Static items={items}>
+      {(row) =>
         row.role === "user" ? (
           <MessageCard key={row.id} role="user">
             <Text wrap="wrap">{row.text}</Text>
@@ -102,13 +142,13 @@ const Transcript = memo(function Transcript({
         ) : (
           <MessageCard key={row.id} role="assistant">
             {row.steps && row.steps.length > 0 ? (
-              <StepLines lines={row.steps} />
+              <AgentStepList steps={row.steps} heading="步骤" />
             ) : null}
             <Text wrap="wrap">{row.text}</Text>
           </MessageCard>
-        ),
-      )}
-    </Box>
+        )
+      }
+    </Static>
   );
 });
 
@@ -129,10 +169,10 @@ export function ChatApp({
   /** 进行中时 Spinner 旁的简短说明（不含工具全文） */
   const [phaseHint, setPhaseHint] = useState("处理中…");
   /** 本轮从「请求模型 / 工具调用」到结束的步骤记录，追加写入、不覆盖 */
-  const [stepLog, setStepLog] = useState<string[]>([]);
+  const [stepLog, setStepLog] = useState<AgentStep[]>([]);
   const [errorBanner, setErrorBanner] = useState<string | null>(null);
   const abortRef = useRef<AbortController | null>(null);
-  const stepLogRef = useRef<string[]>([]);
+  const stepLogRef = useRef<AgentStep[]>([]);
   const idSeq = useRef(0);
   const startedSingle = useRef(false);
 
@@ -166,10 +206,12 @@ export function ChatApp({
           messages: messagesRef.current,
           cwd,
           signal: ac.signal,
-          onStatus: (hint) => {
-            setPhaseHint(hint);
-            stepLogRef.current.push(hint);
-            setStepLog([...stepLogRef.current]);
+          onStatus: ({ spinnerHint, step }) => {
+            setPhaseHint(spinnerHint);
+            if (step) {
+              stepLogRef.current.push(step);
+              setStepLog([...stepLogRef.current]);
+            }
           },
           onStreamReset: () => {
             setStreamText("");
@@ -272,14 +314,7 @@ export function ChatApp({
           borderColor={theme.border}
           borderDimColor
         >
-          <Text bold color={theme.hint}>
-            步骤
-          </Text>
-          {stepLog.map((line, i) => (
-            <Text key={`${i}\0${line}`} color={theme.hint} wrap="wrap">
-              {i + 1}. {line}
-            </Text>
-          ))}
+          <AgentStepList steps={stepLog} heading="进行中" compact />
         </Box>
       ) : null}
 

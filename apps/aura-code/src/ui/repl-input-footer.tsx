@@ -1,16 +1,38 @@
-import React, { memo, useState } from "react";
-import { Box, Text } from "ink";
+import React, { memo, useEffect, useState } from "react";
+import { Box, Text, useStdout } from "ink";
 import { UncontrolledTextInput } from "ink-text-input";
+import { RESIZE_SETTLE_MS } from "./stable-stdout.js";
 import { theme } from "./theme.js";
 
 export type ReplInputFooterProps = {
   onSubmitLine: (line: string) => void;
 };
 
-/** 顶部分隔线：无 props；只在挂载时算宽度 */
+/** 顶部分隔线：宽度与 Ink 使用的 stdout（含稳定列宽代理）一致 */
 const ReplRuleLine = memo(function ReplRuleLine(): React.JSX.Element {
+  const { stdout } = useStdout();
+  const [, layoutBump] = useState(0);
+  useEffect(() => {
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const onResize = (): void => {
+      if (timer !== null) {
+        clearTimeout(timer);
+      }
+      timer = setTimeout(() => {
+        timer = null;
+        layoutBump((n) => n + 1);
+      }, RESIZE_SETTLE_MS + 10);
+    };
+    stdout.on("resize", onResize);
+    return () => {
+      if (timer !== null) {
+        clearTimeout(timer);
+      }
+      stdout.off("resize", onResize);
+    };
+  }, [stdout]);
   const rule = "─".repeat(
-    Math.max(16, Math.min(64, (process.stdout.columns ?? 48) - 4)),
+    Math.max(16, Math.min(64, (stdout.columns ?? 48) - 4)),
   );
   return <Text dimColor>{rule}</Text>;
 });

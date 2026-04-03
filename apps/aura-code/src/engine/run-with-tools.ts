@@ -9,6 +9,13 @@ import {
   getDefaultTools,
   MAX_TOOL_ROUNDS,
 } from "../tools/registry.js";
+import {
+  formatToolInvoke,
+  formatToolResult,
+  type RunStatusUpdate,
+} from "./status-step.js";
+
+export type { AgentStep, RunStatusUpdate } from "./status-step.js";
 
 export type RunWithToolsOptions = {
   chatUrl: string;
@@ -18,10 +25,9 @@ export type RunWithToolsOptions = {
   cwd: string;
   signal: AbortSignal;
   /**
-   * 简短状态提示（一行级别），不包含工具原始输出或长正文。
-   * 用于终端里 Spinner 旁展示进度。
+   * Spinner 旁短文案；可选追加一条结构化步骤（工具面板与对话历史共用）。
    */
-  onStatus?: (hint: string) => void;
+  onStatus?: (update: RunStatusUpdate) => void;
   /** 每一轮向模型发起流式请求前清空 UI 缓冲（避免多轮串台） */
   onStreamReset?: () => void;
   /** 当前轮模型正文增量（流式） */
@@ -33,12 +39,6 @@ export type RunWithToolsResult = {
   assistantText: string;
   error?: string;
 };
-
-function shortenToolList(names: string[], maxLen = 72): string {
-  const s = names.join(", ");
-  if (s.length <= maxLen) return s;
-  return `${s.slice(0, maxLen - 1)}…`;
-}
 
 /**
  * LLM ↔ 工具循环：非流式多轮，直到无 tool_calls 或达到轮数上限。
@@ -52,7 +52,14 @@ export async function runWithTools(
   for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
     opts.signal.throwIfAborted();
     opts.onStreamReset?.();
-    opts.onStatus?.(`第 ${round + 1} 轮：正在请求模型…`);
+    opts.onStatus?.({
+      spinnerHint: `第 ${round + 1} 轮 · 请求模型`,
+      step: {
+        tone: "round",
+        title: `第 ${round + 1} 轮`,
+        detail: "请求模型…",
+      },
+    });
 
     let streamed = await streamChatCompletionRound({
       chatUrl: opts.chatUrl,
@@ -74,9 +81,13 @@ export async function runWithTools(
       (!calls || calls.length === 0)
     ) {
       opts.onStreamReset?.();
-      opts.onStatus?.(
-        `第 ${round + 1} 轮：流式未返回工具结构，改用非流式补全…`,
-      );
+      opts.onStatus?.({
+        spinnerHint: "流式工具结构不完整 · 非流式补全",
+        step: {
+          tone: "note",
+          title: "流式响应未带回工具 JSON，已改用非流式请求",
+        },
+      });
       const fb = await fetchNonStreaming({
         chatUrl: opts.chatUrl,
         apiKey: opts.apiKey,
@@ -97,16 +108,32 @@ export async function runWithTools(
 
     if (calls?.length) {
       opts.onStreamReset?.();
-      const names = calls.map((c) => c.function.name);
-      opts.onStatus?.(
-        `第 ${round + 1} 轮：调用工具 (${calls.length})：${shortenToolList(names)}`,
-      );
+      opts.onStatus?.({
+        spinnerHint:
+          calls.length === 1
+            ? `执行工具 · ${calls[0]!.function.name}`
+            : `并行执行 ${calls.length} 个工具`,
+        step: {
+          tone: "note",
+          title:
+            calls.length === 1
+              ? `调用 1 个工具`
+              : `并行调用 ${calls.length} 个工具`,
+        },
+      });
 
       opts.messages.push({
         role: "assistant",
         content: msg.content ?? null,
         tool_calls: calls,
       });
+
+      for (const tc of calls) {
+        opts.onStatus?.({
+          spinnerHint: `${tc.function.name} · 运行`,
+          step: formatToolInvoke(tc),
+        });
+      }
 
       const pairs = await Promise.all(
         calls.map(async (tc) => {
@@ -121,8 +148,18 @@ export async function runWithTools(
           tool_call_id: tc.id,
           content: out,
         });
+        opts.onStatus?.({
+          spinnerHint: `${tc.function.name} · ${out.trimStart().startsWith("错误：") ? "失败" : "完成"}`,
+          step: formatToolResult(tc.function.name, out),
+        });
       }
-      opts.onStatus?.(`第 ${round + 1} 轮：已收到工具结果，继续请求模型…`);
+      opts.onStatus?.({
+        spinnerHint: "工具已完成 · 请求模型",
+        step: {
+          tone: "note",
+          title: "已注入工具结果，继续请求模型",
+        },
+      });
       continue;
     }
 
@@ -140,7 +177,14 @@ export async function runWithTools(
     role: "assistant",
     content: errMsg,
   });
-  opts.onStatus?.("已达轮次上限");
+  opts.onStatus?.({
+    spinnerHint: `已达工具调用轮数上限（${MAX_TOOL_ROUNDS}）`,
+    step: {
+      tone: "fail",
+      title: "已达轮次上限",
+      detail: `已进行 ${MAX_TOOL_ROUNDS} 轮，请缩小任务范围后重试`,
+    },
+  });
   return {
     assistantText: errMsg,
     error: errMsg,
