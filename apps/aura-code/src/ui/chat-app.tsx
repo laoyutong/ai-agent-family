@@ -6,7 +6,7 @@ import React, {
   useRef,
   useState,
 } from "react";
-import { Box, Static, Text, useApp, useInput } from "ink";
+import { Box, Static, Text, useApp, useInput, useStdout } from "ink";
 import Spinner from "ink-spinner";
 import type { ChatMessage } from "../services/llm/types.js";
 import { runWithTools } from "../engine/run-with-tools.js";
@@ -18,9 +18,67 @@ import {
 } from "./session-options.js";
 import { InfoPanel } from "./info-panel.js";
 import { ReplInputFooter } from "./repl-input-footer.js";
+import { RESIZE_SETTLE_MS } from "./stable-stdout.js";
 import { theme } from "./theme.js";
+import { buildUserTranscriptPaddedRows } from "./user-transcript-rows.js";
 
 const MemoInfoPanel = memo(InfoPanel);
+
+/** 收紧模型输出里的多余空行与行尾空白，减轻终端里段落间距过大的观感 */
+function tightenTranscriptText(text: string): string {
+  return text
+    .replace(/(?:\r?\n[ \t]*){2,}/g, "\n")
+    .replace(/[ \t]+$/gm, "")
+    .trim();
+}
+
+/** 用户历史：按列宽折行，行尾补空格使背景在可视行上拉满；底色仅在有字符的 Text 行上 */
+const UserTranscriptLines = memo(function UserTranscriptLines(props: {
+  text: string;
+}): React.JSX.Element | null {
+  const { stdout } = useStdout();
+  const [, layoutBump] = useState(0);
+  useEffect(() => {
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const onResize = (): void => {
+      if (timer !== null) {
+        clearTimeout(timer);
+      }
+      timer = setTimeout(() => {
+        timer = null;
+        layoutBump((n) => n + 1);
+      }, RESIZE_SETTLE_MS + 10);
+    };
+    stdout.on("resize", onResize);
+    return () => {
+      if (timer !== null) {
+        clearTimeout(timer);
+      }
+      stdout.off("resize", onResize);
+    };
+  }, [stdout]);
+
+  const cols = stdout.columns ?? 80;
+  const rows = useMemo(
+    () => buildUserTranscriptPaddedRows(props.text, cols),
+    [props.text, cols, layoutBump],
+  );
+
+  if (rows.length === 0) return null;
+  return (
+    <Box flexDirection="column" gap={0} width="100%">
+      {rows.map((row, i) => (
+        <Text
+          key={i}
+          color={theme.user}
+          backgroundColor={theme.userMessageTint}
+        >
+          {row}
+        </Text>
+      ))}
+    </Box>
+  );
+});
 
 type TranscriptItem = {
   id: string;
@@ -41,23 +99,18 @@ export type ChatAppProps = {
   singlePrompt?: string;
 };
 
-/** 助手消息里「工具 / 轮次」区块：与正文分区，避免 Ink 换行时视觉上糊在一起 */
+/** 仅有「轮次分隔」、尚无工具步骤时跳过步骤区，避免空白 */
+function hasRenderableAgentSteps(steps: AgentStep[]): boolean {
+  return steps.some((s) => s.tone !== "round");
+}
+
+/** 助手消息内工具步骤：与正文同一 MessageCard，无独立边框 */
 const AssistantStepsBlock = memo(function AssistantStepsBlock(props: {
   steps: AgentStep[];
-  heading: string;
 }): React.JSX.Element {
   return (
-    <Box
-      flexDirection="column"
-      marginBottom={1}
-      paddingLeft={1}
-      paddingY={0}
-      borderLeft
-      borderStyle="single"
-      borderDimColor
-      borderLeftColor={theme.hint}
-    >
-      <AgentStepList steps={props.steps} heading={props.heading} compact />
+    <Box flexDirection="column" gap={0} marginBottom={0} width="100%">
+      <AgentStepList steps={props.steps} compact />
     </Box>
   );
 });
@@ -68,28 +121,31 @@ const MessageCard = memo(function MessageCard(props: {
 }): React.JSX.Element {
   const isUser = props.role === "user";
   const accent = isUser ? theme.user : theme.assistant;
-  const tag = isUser ? " YOU " : " AI ";
-  const label = isUser ? "你" : "助手";
+  /** 用户 ● / 助手 ◆：形状不同，不只靠颜色 */
+  const glyph = isUser ? "●" : "◆";
   return (
     <Box
-      flexDirection="column"
-      marginBottom={0}
-      paddingLeft={1}
+      flexDirection="row"
+      alignItems="flex-start"
+      width="100%"
+      minWidth={0}
       paddingY={0}
-      borderLeft
-      borderStyle="single"
-      borderLeftColor={accent}
     >
-      <Box marginBottom={0}>
-        <Text backgroundColor={accent} color="black" bold>
-          {tag}
-        </Text>
-        <Text> </Text>
-        <Text bold color={accent}>
-          {label}
+      <Box flexShrink={0}>
+        <Text color={accent} bold>
+          {glyph}
         </Text>
       </Box>
-      <Box flexDirection="column" paddingTop={0} width="100%">
+      <Text> </Text>
+      <Box
+        flexGrow={1}
+        flexShrink={1}
+        flexDirection="column"
+        gap={0}
+        width="100%"
+        minWidth={0}
+        paddingY={0}
+      >
         {props.children}
       </Box>
     </Box>
@@ -99,7 +155,7 @@ const MessageCard = memo(function MessageCard(props: {
 function stepToneStyle(tone: AgentStep["tone"]) {
   switch (tone) {
     case "invoke":
-      return { glyph: "▸ ", color: theme.user };
+      return { glyph: "", color: theme.assistant };
     case "done":
       return { glyph: "✓ ", color: theme.assistant };
     case "fail":
@@ -114,46 +170,60 @@ function stepToneStyle(tone: AgentStep["tone"]) {
 
 const AgentStepList = memo(function AgentStepList({
   steps,
-  heading,
   compact = false,
 }: {
   steps: AgentStep[];
-  heading: string;
-  /** 为 true 时不留列表底部外边距（外层分区 Box 已负责与正文的间距） */
   compact?: boolean;
 }): React.JSX.Element {
+  let toolIdx = 0;
   return (
-    <Box flexDirection="column" marginBottom={compact ? 0 : 1} width="100%">
-      <Box marginBottom={1}>
-        <Text bold color={theme.hint}>
-          {heading}
-        </Text>
-      </Box>
+    <Box flexDirection="column" gap={0} marginBottom={compact ? 0 : 1} width="100%">
       {steps.map((step, i) => {
+        if (step.tone === "round") {
+          return null;
+        }
+
+        toolIdx += 1;
         const { glyph, color } = stepToneStyle(step.tone);
-        const n = `${i + 1}.`;
+        const n = `${toolIdx}.`;
+        const indexColW = n.length + 1;
+        const stepNestPad = indexColW + 2;
+        const outcomeErr =
+          step.outcome &&
+          (/^执行结果：错误：/.test(step.outcome) ||
+            step.outcome.trimStart().startsWith("错误："));
+        const rowKey = `${step.toolCallId ?? "s"}-${i}`;
         return (
-          <Box key={i} flexDirection="column" marginTop={0}>
+          <Box key={rowKey} flexDirection="column" marginTop={0}>
             <Box flexDirection="row" alignItems="flex-start">
               <Box flexShrink={0}>
                 <Text dimColor>{n} </Text>
               </Box>
               <Box flexGrow={1} flexShrink={1}>
-                <Text
-                  wrap="wrap"
-                  color={color}
-                  bold={step.tone === "round"}
-                >
+                <Text wrap="wrap" color={color}>
                   {glyph}
                   {step.title}
                 </Text>
               </Box>
             </Box>
             {step.detail ? (
-              <Box paddingLeft={n.length + 1}>
+              <Box paddingLeft={stepNestPad}>
                 <Text dimColor wrap="wrap">
                   {step.detail}
                 </Text>
+              </Box>
+            ) : null}
+            {step.outcome ? (
+              <Box paddingLeft={stepNestPad}>
+                {outcomeErr ? (
+                  <Text color={theme.error} wrap="wrap">
+                    {step.outcome}
+                  </Text>
+                ) : (
+                  <Text wrap="wrap" color={theme.assistant}>
+                    {step.outcome}
+                  </Text>
+                )}
               </Box>
             ) : null}
           </Box>
@@ -179,11 +249,12 @@ export function ChatApp({
   const [streamText, setStreamText] = useState("");
   /** 进行中时 Spinner 旁的简短说明（不含工具全文） */
   const [phaseHint, setPhaseHint] = useState("处理中…");
-  /** 本轮从「请求模型 / 工具调用」到结束的步骤记录，追加写入、不覆盖 */
+  /** 合并展示：轮次分隔 / 失败条目 + 当前正在执行的工具（单行） */
   const [stepLog, setStepLog] = useState<AgentStep[]>([]);
   const [errorBanner, setErrorBanner] = useState<string | null>(null);
   const abortRef = useRef<AbortController | null>(null);
   const stepLogRef = useRef<AgentStep[]>([]);
+  const runningToolStepRef = useRef<AgentStep | null>(null);
   const idSeq = useRef(0);
   const startedSingle = useRef(false);
 
@@ -204,6 +275,7 @@ export function ChatApp({
       setBusy(true);
       setStreamText("");
       stepLogRef.current = [];
+      runningToolStepRef.current = null;
       setStepLog([]);
       setPhaseHint("处理中…");
       const ac = new AbortController();
@@ -220,9 +292,38 @@ export function ChatApp({
           onStatus: ({ spinnerHint, step }) => {
             setPhaseHint(spinnerHint);
             if (step) {
-              stepLogRef.current.push(step);
-              setStepLog([...stepLogRef.current]);
+              if (step.tone === "round" || step.tone === "fail") {
+                runningToolStepRef.current = null;
+                stepLogRef.current.push(step);
+              } else if (
+                step.tone === "invoke" &&
+                (step.outcome !== undefined || step.invokeComplete)
+              ) {
+                runningToolStepRef.current = null;
+                if (step.toolCallId) {
+                  const idx = stepLogRef.current.findIndex(
+                    (s) => s.toolCallId === step.toolCallId,
+                  );
+                  if (idx >= 0) {
+                    stepLogRef.current[idx] = step;
+                  } else {
+                    stepLogRef.current.push(step);
+                  }
+                } else {
+                  stepLogRef.current.push(step);
+                }
+              } else {
+                runningToolStepRef.current = step;
+              }
+            } else {
+              runningToolStepRef.current = null;
             }
+            setStepLog([
+              ...stepLogRef.current,
+              ...(runningToolStepRef.current
+                ? [runningToolStepRef.current]
+                : []),
+            ]);
           },
           onStreamReset: () => {
             setStreamText("");
@@ -231,14 +332,20 @@ export function ChatApp({
             setStreamText((prev) => prev + chunk);
           },
         });
-        const steps = [...stepLogRef.current];
+        const persistedSteps = stepLogRef.current.filter(
+          (s) =>
+            s.tone === "fail" ||
+            (s.tone === "invoke" &&
+              (s.outcome !== undefined || s.invokeComplete)),
+        );
         setItems((prev) => [
           ...prev,
           {
             id: nextId(),
             role: "assistant",
             text: assistantText,
-            steps: steps.length > 0 ? steps : undefined,
+            steps:
+              persistedSteps.length > 0 ? persistedSteps : undefined,
           },
         ]);
         // 轮次耗尽等：assistant 气泡已与 error 全文一致，不再叠一条红色框避免重复
@@ -257,6 +364,7 @@ export function ChatApp({
         setPhaseHint("");
         setStreamText("");
         stepLogRef.current = [];
+        runningToolStepRef.current = null;
         setStepLog([]);
       }
     },
@@ -325,24 +433,20 @@ export function ChatApp({
             <MemoInfoPanel key="__info__" model={options.model} cwd={cwd} />
           ) : row.role === "user" ? (
             <MessageCard key={row.id} role="user">
-              <Text wrap="wrap">{row.text}</Text>
+              <UserTranscriptLines text={row.text} />
             </MessageCard>
           ) : (
             <MessageCard key={row.id} role="assistant">
-              <Box flexDirection="column" width="100%">
-                {row.steps && row.steps.length > 0 ? (
-                  <AssistantStepsBlock
-                    steps={row.steps}
-                    heading="执行步骤"
-                  />
+              <Box flexDirection="column" gap={0} width="100%">
+                {row.steps &&
+                row.steps.length > 0 &&
+                hasRenderableAgentSteps(row.steps) ? (
+                  <AssistantStepsBlock steps={row.steps} />
                 ) : null}
-                <Box flexDirection="column">
-                  {row.steps && row.steps.length > 0 ? (
-                    <Text dimColor bold>
-                      回复
-                    </Text>
-                  ) : null}
-                  <Text wrap="wrap">{row.text}</Text>
+                <Box flexDirection="column" gap={0}>
+                  <Text wrap="wrap" color={theme.assistant}>
+                    {tightenTranscriptText(row.text)}
+                  </Text>
                 </Box>
               </Box>
             </MessageCard>
@@ -352,24 +456,21 @@ export function ChatApp({
 
       {busy ? (
         <MessageCard role="assistant">
-          <Box flexDirection="column" width="100%">
-            {stepLog.length > 0 ? (
-              <AssistantStepsBlock steps={stepLog} heading="进行中" />
+          <Box flexDirection="column" gap={0} width="100%">
+            {stepLog.length > 0 && hasRenderableAgentSteps(stepLog) ? (
+              <AssistantStepsBlock steps={stepLog} />
             ) : null}
             {streamText.length > 0 ? (
-              <Box flexDirection="column" width="100%">
-                {stepLog.length > 0 ? (
-                  <Text dimColor bold>
-                    生成中
-                  </Text>
-                ) : null}
+              <Box flexDirection="column" gap={0} width="100%">
                 {/*
                   勿在 <Text wrap> 内嵌套带样式的子 <Text>：Ink squash/wrap 与 log-update
                   擦行在流式结束、转入 Static 时易错位。
                 */}
                 <Box flexDirection="row" alignItems="flex-start" width="100%">
                   <Box flexGrow={1} flexShrink={1}>
-                    <Text wrap="wrap">{streamText}</Text>
+                    <Text wrap="wrap" color={theme.assistant}>
+                      {tightenTranscriptText(streamText)}
+                    </Text>
                   </Box>
                   <Box flexShrink={0}>
                     <Text color={theme.hint}>▍</Text>
@@ -403,7 +504,7 @@ export function ChatApp({
             出错了
           </Text>
           <Text color={theme.error} wrap="wrap">
-            {errorBanner}
+            {tightenTranscriptText(errorBanner)}
           </Text>
         </Box>
       ) : null}

@@ -19,7 +19,7 @@ export function InfoPanel({ model, cwd }: InfoPanelProps): React.JSX.Element {
       flexDirection="column"
       borderStyle="round"
       borderColor={theme.border}
-      paddingX={1}
+      paddingX={0}
       paddingY={0}
       marginBottom={0}
       gap={0}

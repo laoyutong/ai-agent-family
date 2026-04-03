@@ -5,7 +5,14 @@ export type AgentStepTone = "round" | "invoke" | "done" | "fail" | "note";
 export type AgentStep = {
   tone: AgentStepTone;
   title: string;
+  /** OpenAI tool_calls[].id，用于合并同一工具的状态更新、避免重复条目 */
+  toolCallId?: string;
+  /** 调用说明（父级下的子行） */
   detail?: string;
+  /** 工具已正常结束（无 outcome 文案时也需写入日志） */
+  invokeComplete?: boolean;
+  /** 仅失败等异常：简短结果说明 */
+  outcome?: string;
 };
 
 /** 传给 UI：一行 Spinner 文案 + 可选步骤条目 */
@@ -43,6 +50,26 @@ function argStr(args: Record<string, unknown>, k: string): string {
 
 function toolLabel(name: string): string {
   return TOOL_LABEL[name] ?? name;
+}
+
+/** 「执行xxx工具 / xxx工具的执行结果」中的 xxx（简短名） */
+const TOOL_EXECUTE_NOUN: Record<string, string> = {
+  run_command: "Shell",
+  read_file: "读文件",
+  write_file: "写入文件",
+  search_replace: "文本替换",
+  glob_files: "文件查找",
+  grep_content: "内容搜索",
+};
+
+function toolExecuteNoun(name: string): string {
+  return TOOL_EXECUTE_NOUN[name] ?? toolLabel(name);
+}
+
+/** 工具完成态：统一带「执行结果：」前缀，便于辨认 */
+function withOutcomeLabel(body: string, bodyMax: number): string {
+  const clipped = clipOneLine(body.replace(/\n/g, " "), bodyMax);
+  return `执行结果：${clipped}`;
 }
 
 /** 一行内说明「对谁 / 做了什么」，与结果摘要拼接 */
@@ -84,52 +111,28 @@ function shortToolContext(tc: ToolCall): string {
   }
 }
 
-function summarizeToolOutput(name: string, text: string): string {
-  const err = text.startsWith("错误：");
-  const raw = text.trim();
-
-  if (name === "read_file" && !err) {
-    const lines = raw.split("\n");
-    const n = lines.length;
-    if (n <= 1) {
-      return clipOneLine(lines[0] ?? "(空)", 56);
-    }
-    return `… ${n} 行`;
-  }
-  if (name === "glob_files" && !err) {
-    const ls = raw.split("\n").filter(Boolean);
-    const n = ls.length;
-    if (n === 0) return "无匹配";
-    if (n === 1) return clipOneLine(ls[0] ?? "", 44);
-    return `${n} 条`;
-  }
-  if (name === "grep_content" && !err) {
-    const ls = raw.split("\n").filter(Boolean);
-    const n = ls.length;
-    if (n === 0) return "无匹配";
-    if (n === 1) return clipOneLine(ls[0] ?? "", 56);
-    return `${n} 处`;
-  }
-  if (name === "write_file" && !err) {
-    return clipOneLine(raw.replace(/\n/g, " "), 48);
-  }
-  if (name === "search_replace" && !err) {
-    return clipOneLine(raw.replace(/\n/g, " "), 48);
-  }
-  return clipOneLine(raw.replace(/\n/g, "↵"), 64);
-}
-
-/** 单条工具：调用参数 + 结果一条写完（替代原先的 invoke + result 两步） */
-export function formatToolOutcome(tc: ToolCall, text: string): AgentStep {
+/**
+ * 单行：执行（含 API 名）+ 具体操作对象，无「说明」等前缀。
+ */
+export function formatToolRunning(tc: ToolCall): AgentStep {
   const name = tc.function.name;
-  const label = toolLabel(name);
-  const err = text.startsWith("错误：");
+  const noun = toolExecuteNoun(name);
+  const args = parseArgs(tc);
+  const head = `执行${noun}工具（${name}）`;
+
+  if (name === "run_command") {
+    const cmd = clipOneLine(argStr(args, "command"), 48);
+    const title = cmd ? `${head} · ${cmd}` : head;
+    return { tone: "invoke", title, toolCallId: tc.id };
+  }
+
   const ctx = shortToolContext(tc);
-  const sum = summarizeToolOutput(name, text);
-  const detail = ctx ? `${ctx} → ${sum}` : sum;
-  return {
-    tone: err ? "fail" : "done",
-    title: label,
-    detail: detail || undefined,
-  };
+  const title = ctx ? `${head} · ${ctx}` : head;
+  return { tone: "invoke", title, toolCallId: tc.id };
 }
+
+/** 工具失败：一行「执行结果：…」（成功态不再展示结果摘要） */
+export function formatToolOutcomeSummary(_tc: ToolCall, text: string): string {
+  return withOutcomeLabel(text.trim(), 56);
+}
+

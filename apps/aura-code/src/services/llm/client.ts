@@ -281,6 +281,27 @@ export type StreamRoundOptions = FetchStreamingOptions & {
 };
 
 /**
+ * 同时兼容两种 SSE：`delta` 为增量片，或为「截至当前的全文」。
+ * 后者若用 `buffer += delta` 会整段重复拼接，此处按前缀归一并只下发新增后缀。
+ */
+function mergeStreamTextBuffer(
+  buffer: string,
+  incoming: string,
+  emitDelta: (piece: string) => void,
+): string {
+  if (incoming.length === 0) return buffer;
+  // 同一全文快照被重复推送时不应再拼接
+  if (incoming === buffer) return buffer;
+  if (buffer.length > 0 && incoming.startsWith(buffer)) {
+    const piece = incoming.slice(buffer.length);
+    if (piece.length > 0) emitDelta(piece);
+    return incoming;
+  }
+  emitDelta(incoming);
+  return buffer + incoming;
+}
+
+/**
  * 单次 chat/completions 流式请求，聚合完整 assistant 消息（含流式 tool_calls 增量）。
  */
 export async function streamChatCompletionRound(
@@ -347,8 +368,11 @@ export async function streamChatCompletionRound(
           onFirstChunk();
         }
         if (parsed.content) {
-          contentBuf += parsed.content;
-          onTextDelta?.(parsed.content);
+          contentBuf = mergeStreamTextBuffer(
+            contentBuf,
+            parsed.content,
+            (piece) => onTextDelta?.(piece),
+          );
         }
         if (parsed.toolCalls?.length) {
           mergeToolStreamDeltas(toolAcc, parsed.toolCalls);

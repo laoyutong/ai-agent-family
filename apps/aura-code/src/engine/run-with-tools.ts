@@ -1,15 +1,20 @@
+import chalk from "chalk";
 import {
   fetchNonStreaming,
   streamChatCompletionRound,
   type StreamRoundResult,
 } from "../services/llm/client.js";
-import type { ChatMessage } from "../services/llm/types.js";
+import type { ChatMessage, ToolCall } from "../services/llm/types.js";
 import {
   executeToolCall,
   getDefaultTools,
   MAX_TOOL_ROUNDS,
 } from "../tools/registry.js";
-import { formatToolOutcome, type RunStatusUpdate } from "./status-step.js";
+import {
+  formatToolOutcomeSummary,
+  formatToolRunning,
+  type RunStatusUpdate,
+} from "./status-step.js";
 
 export type { AgentStep, RunStatusUpdate } from "./status-step.js";
 
@@ -36,6 +41,50 @@ export type RunWithToolsResult = {
   error?: string;
 };
 
+function clipLogLine(s: string, max: number): string {
+  const t = s.replace(/\s+/g, " ").trim();
+  if (t.length <= max) return t;
+  return `${t.slice(0, Math.max(1, max - 1))}…`;
+}
+
+/** 默认关闭：与 Ink 内步骤块重复刷屏。调试时：`AURA_CODE_LOG_TOOLS=1` */
+function toolTraceToStderr(): boolean {
+  return process.env.AURA_CODE_LOG_TOOLS === "1";
+}
+
+function logToolRunStart(tc: ToolCall): void {
+  if (!toolTraceToStderr()) return;
+  const r = formatToolRunning(tc);
+  console.error(chalk.dim("·"), chalk.hex("#c9a227")("[工具]"), r.title);
+}
+
+function logToolRunEnd(tc: ToolCall, out: string): void {
+  if (!toolTraceToStderr()) return;
+  const r = formatToolRunning(tc);
+  const err = out.trimStart().startsWith("错误：");
+  if (err) {
+    const first = (out.trim().split("\n")[0] ?? "").trim();
+    console.error(
+      chalk.dim("·"),
+      chalk.red("[失败]"),
+      r.title,
+      chalk.dim(clipLogLine(first, 160)),
+    );
+    return;
+  }
+  const trimmed = out.trim();
+  const suffix =
+    trimmed.length === 0
+      ? chalk.dim("(无输出)")
+      : chalk.dim(`(返回 ${trimmed.length} 字)`);
+  console.error(
+    chalk.dim("·"),
+    chalk.green("[完成]"),
+    r.title,
+    suffix,
+  );
+}
+
 /**
  * LLM ↔ 工具循环：非流式多轮，直到无 tool_calls 或达到轮数上限。
  * 会就地修改 `messages`（追加 assistant / tool）。
@@ -48,10 +97,14 @@ export async function runWithTools(
   for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
     opts.signal.throwIfAborted();
     opts.onStreamReset?.();
-    opts.onStatus?.({
-      spinnerHint: `第 ${round + 1} 轮 · 请求模型`,
-      step: { tone: "round", title: `· 第 ${round + 1} 轮` },
-    });
+    opts.onStatus?.(
+      round > 0
+        ? {
+            spinnerHint: "请求模型…",
+            step: { tone: "round", title: "" },
+          }
+        : { spinnerHint: "请求模型…" },
+    );
 
     let streamed = await streamChatCompletionRound({
       chatUrl: opts.chatUrl,
@@ -94,12 +147,17 @@ export async function runWithTools(
 
     if (calls?.length) {
       opts.onStreamReset?.();
-      opts.onStatus?.({
-        spinnerHint:
-          calls.length === 1
-            ? `执行工具 · ${calls[0]!.function.name}`
-            : `并行执行 ${calls.length} 个工具`,
-      });
+      if (calls.length === 1) {
+        const tc = calls[0]!;
+        opts.onStatus?.({
+          spinnerHint: `${tc.function.name} · 运行`,
+          step: formatToolRunning(tc),
+        });
+      } else {
+        opts.onStatus?.({
+          spinnerHint: `并行 ${calls.length} 个工具`,
+        });
+      }
 
       opts.messages.push({
         role: "assistant",
@@ -109,8 +167,9 @@ export async function runWithTools(
 
       const pairs = await Promise.all(
         calls.map(async (tc) => {
-          opts.onStatus?.({ spinnerHint: `${tc.function.name} · 运行` });
+          logToolRunStart(tc);
           const out = await executeToolCall(tc, opts.cwd, opts.signal);
+          logToolRunEnd(tc, out);
           return { tc, out };
         }),
       );
@@ -121,12 +180,21 @@ export async function runWithTools(
           tool_call_id: tc.id,
           content: out,
         });
+        const runningStep = formatToolRunning(tc);
+        const failed = out.trimStart().startsWith("错误：");
         opts.onStatus?.({
-          spinnerHint: `${tc.function.name} · ${out.trimStart().startsWith("错误：") ? "失败" : "完成"}`,
-          step: formatToolOutcome(tc, out),
+          spinnerHint: `${tc.function.name} · ${failed ? "失败" : "完成"}`,
+          step: {
+            tone: "invoke",
+            title: runningStep.title,
+            toolCallId: runningStep.toolCallId,
+            ...(failed
+              ? { outcome: formatToolOutcomeSummary(tc, out) }
+              : { invokeComplete: true }),
+          },
         });
       }
-      opts.onStatus?.({ spinnerHint: "工具已完成 · 请求模型" });
+      opts.onStatus?.({ spinnerHint: "请求模型…" });
       continue;
     }
 
