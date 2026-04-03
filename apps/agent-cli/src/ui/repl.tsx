@@ -10,8 +10,9 @@ export async function runRepl(options: ReplOptions): Promise<void> {
     {
       exitOnCtrlC: false,
       patchConsole: true,
-      maxFps: 60,
-      incrementalRendering: true,
+      maxFps: 30,
+      // incremental 模式在部分终端下会残留旧行或看起来像「重复输出」
+      incrementalRendering: false,
     },
   );
   await waitUntilExit();
@@ -25,8 +26,8 @@ export async function runSingleShotStream(
     {
       exitOnCtrlC: false,
       patchConsole: true,
-      maxFps: 60,
-      incrementalRendering: true,
+      maxFps: 30,
+      incrementalRendering: false,
     },
   );
   await waitUntilExit();

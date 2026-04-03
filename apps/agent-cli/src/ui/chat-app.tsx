@@ -1,21 +1,24 @@
 import React, {
+  memo,
   useCallback,
   useEffect,
   useRef,
   useState,
 } from "react";
-import { Box, Static, Text, useApp, useInput } from "ink";
+import { Box, Text, useApp, useInput } from "ink";
 import Spinner from "ink-spinner";
-import TextInput from "ink-text-input";
-import { fetchStreaming } from "../services/llm/client.js";
 import type { ChatMessage } from "../services/llm/types.js";
+import { runWithTools } from "../engine/run-with-tools.js";
 import {
-  DEFAULT_SYSTEM,
+  buildAgentSystem,
   isAbortError,
   type ReplOptions,
 } from "./session-options.js";
 import { InfoPanel } from "./info-panel.js";
+import { ReplInputFooter } from "./repl-input-footer.js";
 import { theme } from "./theme.js";
+
+const MemoInfoPanel = memo(InfoPanel);
 
 type TranscriptItem = {
   id: string;
@@ -29,7 +32,7 @@ export type ChatAppProps = {
   singlePrompt?: string;
 };
 
-function MessageCard(props: {
+const MessageCard = memo(function MessageCard(props: {
   role: "user" | "assistant";
   children: React.ReactNode;
 }): React.JSX.Element {
@@ -61,7 +64,29 @@ function MessageCard(props: {
       </Box>
     </Box>
   );
-}
+});
+
+const Transcript = memo(function Transcript({
+  items,
+}: {
+  items: TranscriptItem[];
+}): React.JSX.Element {
+  return (
+    <Box flexDirection="column">
+      {items.map((row) =>
+        row.role === "user" ? (
+          <MessageCard key={row.id} role="user">
+            <Text wrap="wrap">{row.text}</Text>
+          </MessageCard>
+        ) : (
+          <MessageCard key={row.id} role="assistant">
+            <Text wrap="wrap">{row.text}</Text>
+          </MessageCard>
+        ),
+      )}
+    </Box>
+  );
+});
 
 export function ChatApp({
   mode,
@@ -69,13 +94,16 @@ export function ChatApp({
   singlePrompt = "",
 }: ChatAppProps): React.JSX.Element {
   const { exit } = useApp();
+  const cwd = options.cwd ?? process.cwd();
   const [items, setItems] = useState<TranscriptItem[]>([]);
   const messagesRef = useRef<ChatMessage[]>([
-    { role: "system", content: options.systemPrompt ?? DEFAULT_SYSTEM },
+    { role: "system", content: buildAgentSystem(options.systemPrompt, cwd) },
   ]);
-  const [draft, setDraft] = useState("");
   const [busy, setBusy] = useState(mode === "single");
+  /** 当前轮模型正在流式输出的正文（完成后会清空并入 transcript） */
   const [streamText, setStreamText] = useState("");
+  /** 进行中时 Spinner 旁的简短说明（不含工具全文） */
+  const [phaseHint, setPhaseHint] = useState("处理中…");
   const [errorBanner, setErrorBanner] = useState<string | null>(null);
   const abortRef = useRef<AbortController | null>(null);
   const idSeq = useRef(0);
@@ -89,6 +117,7 @@ export function ChatApp({
   const runGeneration = useCallback(
     async (userText: string): Promise<void> => {
       setErrorBanner(null);
+      const turnStartLen = messagesRef.current.length;
       messagesRef.current.push({ role: "user", content: userText });
       setItems((prev) => [
         ...prev,
@@ -96,63 +125,50 @@ export function ChatApp({
       ]);
       setBusy(true);
       setStreamText("");
+      setPhaseHint("处理中…");
       const ac = new AbortController();
       abortRef.current = ac;
-      let assistant = "";
 
       try {
-        for await (const chunk of fetchStreaming({
+        const { assistantText, error } = await runWithTools({
           chatUrl: options.chatUrl,
           apiKey: options.apiKey,
           model: options.model,
           messages: messagesRef.current,
+          cwd,
           signal: ac.signal,
-        })) {
-          if (chunk.type === "text") {
-            assistant += chunk.text;
-            setStreamText(assistant);
-          } else if (chunk.type === "error") {
-            setErrorBanner(chunk.message);
-            messagesRef.current.pop();
-            setItems((prev) => prev.slice(0, -1));
-            return;
-          }
-        }
-        messagesRef.current.push({
-          role: "assistant",
-          content: assistant || null,
+          onStatus: (hint) => {
+            setPhaseHint(hint);
+          },
+          onStreamReset: () => {
+            setStreamText("");
+          },
+          onStreamDelta: (chunk) => {
+            setStreamText((prev) => prev + chunk);
+          },
         });
         setItems((prev) => [
           ...prev,
-          { id: nextId(), role: "assistant", text: assistant },
+          { id: nextId(), role: "assistant", text: assistantText },
         ]);
+        // 轮次耗尽等：assistant 气泡已与 error 全文一致，不再叠一条红色框避免重复
+        if (error && error.trim() !== assistantText.trim()) {
+          setErrorBanner(error);
+        }
       } catch (e) {
-        if (isAbortError(e)) {
-          if (assistant.length > 0) {
-            messagesRef.current.push({
-              role: "assistant",
-              content: assistant,
-            });
-            setItems((prev) => [
-              ...prev,
-              { id: nextId(), role: "assistant", text: assistant },
-            ]);
-          } else {
-            messagesRef.current.pop();
-            setItems((prev) => prev.slice(0, -1));
-          }
-        } else {
+        messagesRef.current = messagesRef.current.slice(0, turnStartLen);
+        setItems((prev) => prev.slice(0, -1));
+        if (!isAbortError(e)) {
           setErrorBanner(e instanceof Error ? e.message : String(e));
-          messagesRef.current.pop();
-          setItems((prev) => prev.slice(0, -1));
         }
       } finally {
         abortRef.current = null;
         setBusy(false);
+        setPhaseHint("");
         setStreamText("");
       }
     },
-    [options.apiKey, options.chatUrl, options.model],
+    [options.apiKey, options.chatUrl, options.model, cwd],
   );
 
   useInput(
@@ -182,37 +198,40 @@ export function ChatApp({
     })();
   }, [mode, singlePrompt, runGeneration, exit]);
 
-  const onSubmit = (value: string): void => {
-    if (busy || mode === "single") return;
-    const t = value.trim();
-    if (!t) return;
-    if (t === "exit" || t === "quit") {
-      exit();
-      return;
-    }
-    setDraft("");
-    void runGeneration(t);
-  };
+  const handleSubmitLine = useCallback(
+    (value: string): void => {
+      if (busy || mode === "single") return;
+      const t = value.trim();
+      if (!t) return;
+      if (t === "exit" || t === "quit") {
+        exit();
+        return;
+      }
+      void runGeneration(t);
+    },
+    [busy, mode, exit, runGeneration],
+  );
 
-  const cwd = options.cwd ?? process.cwd();
+  const handleSubmitLineRef = useRef(handleSubmitLine);
+  handleSubmitLineRef.current = handleSubmitLine;
+  const stableOnSubmitLine = useCallback((line: string) => {
+    handleSubmitLineRef.current(line);
+  }, []);
 
   return (
     <Box flexDirection="column" paddingX={1} gap={0}>
-      <InfoPanel model={options.model} cwd={cwd} />
+      <MemoInfoPanel model={options.model} cwd={cwd} />
 
-      <Static items={items} style={{ marginBottom: 0 }}>
-        {(row) =>
-          row.role === "user" ? (
-            <MessageCard key={row.id} role="user">
-              <Text wrap="wrap">{row.text}</Text>
-            </MessageCard>
-          ) : (
-            <MessageCard key={row.id} role="assistant">
-              <Text wrap="wrap">{row.text}</Text>
-            </MessageCard>
-          )
-        }
-      </Static>
+      <Transcript items={items} />
+
+      {busy && streamText.length > 0 ? (
+        <MessageCard role="assistant">
+          <Text wrap="wrap">
+            {streamText}
+            <Text color={theme.hint}>▍</Text>
+          </Text>
+        </MessageCard>
+      ) : null}
 
       {busy && streamText.length === 0 ? (
         <Box
@@ -222,23 +241,17 @@ export function ChatApp({
           borderStyle="round"
           borderColor={theme.border}
           borderDimColor
+          flexDirection="row"
+          flexWrap="wrap"
         >
           <Text color={theme.assistant}>
             <Spinner type="dots" />
           </Text>
-          <Text color={theme.hint}> 正在连接模型…</Text>
-        </Box>
-      ) : null}
-
-      {busy && streamText.length > 0 ? (
-        <MessageCard role="assistant">
-          <Text wrap="wrap">
-            {streamText}
-            <Text color={theme.brand} bold>
-              ▌
-            </Text>
+          <Text color={theme.hint} wrap="wrap">
+            {" "}
+            {phaseHint || "处理中…"}
           </Text>
-        </MessageCard>
+        </Box>
       ) : null}
 
       {errorBanner ? (
@@ -259,44 +272,7 @@ export function ChatApp({
       ) : null}
 
       {mode === "repl" && !busy ? (
-        <Box flexDirection="column" marginTop={0}>
-          <Text dimColor>
-            {"─".repeat(
-              Math.max(16, Math.min(64, (process.stdout.columns ?? 48) - 4)),
-            )}
-          </Text>
-          <Box
-            flexDirection="row"
-            alignItems="center"
-            paddingX={1}
-            borderStyle="round"
-            borderColor={theme.borderFocus}
-          >
-            <Text bold color={theme.prompt}>
-              ›{" "}
-            </Text>
-            <TextInput
-              value={draft}
-              placeholder="有问题尽管问…"
-              focus={!busy}
-              onChange={setDraft}
-              onSubmit={onSubmit}
-            />
-          </Box>
-          <Box marginTop={0} paddingX={1}>
-            <Text dimColor>
-              Enter 发送
-            </Text>
-            <Text dimColor> · </Text>
-            <Text dimColor>
-              Ctrl+C 中断或退出
-            </Text>
-            <Text dimColor> · </Text>
-            <Text dimColor>
-              exit
-            </Text>
-          </Box>
-        </Box>
+        <ReplInputFooter onSubmitLine={stableOnSubmitLine} />
       ) : null}
     </Box>
   );

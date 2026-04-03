@@ -3,8 +3,13 @@ import type {
   ChatMessage,
   LLMStreamChunk,
   OpenAITool,
+  ToolCall,
 } from "./types.js";
-import { parseSseLine } from "./sse-parser.js";
+import {
+  parseChatStreamSseLine,
+  parseSseLine,
+  type ToolCallStreamDelta,
+} from "./sse-parser.js";
 import { readUtf8Lines } from "./stream-read.js";
 
 const RETRY_STATUSES = new Set([408, 429, 500, 502, 503, 504]);
@@ -229,4 +234,144 @@ export async function* fetchStreaming(
   } finally {
     cleanup();
   }
+}
+
+function mergeToolStreamDeltas(
+  acc: Map<number, { id: string; name: string; arguments: string }>,
+  deltas: ToolCallStreamDelta[],
+): void {
+  for (const t of deltas) {
+    const idx = typeof t.index === "number" ? t.index : 0;
+    let cur = acc.get(idx);
+    if (!cur) {
+      cur = { id: "", name: "", arguments: "" };
+      acc.set(idx, cur);
+    }
+    if (t.id) cur.id = t.id;
+    if (t.function?.name) cur.name = t.function.name;
+    if (t.function?.arguments) cur.arguments += t.function.arguments;
+  }
+}
+
+function toolAccToCalls(
+  acc: Map<number, { id: string; name: string; arguments: string }>,
+): ToolCall[] | undefined {
+  if (acc.size === 0) return undefined;
+  return [...acc.entries()]
+    .sort((a, b) => a[0] - b[0])
+    .map(([idx, v]) => ({
+      id: v.id.length > 0 ? v.id : `call_stream_${idx}`,
+      type: "function" as const,
+      function: { name: v.name, arguments: v.arguments },
+    }));
+}
+
+export type StreamRoundResult = {
+  message: {
+    role: "assistant";
+    content: string | null;
+    tool_calls?: ToolCall[];
+  };
+  finish_reason: string | null;
+};
+
+export type StreamRoundOptions = FetchStreamingOptions & {
+  /** 当前轮次模型正文增量（不包含工具结果） */
+  onTextDelta?: (chunk: string) => void;
+};
+
+/**
+ * 单次 chat/completions 流式请求，聚合完整 assistant 消息（含流式 tool_calls 增量）。
+ */
+export async function streamChatCompletionRound(
+  options: StreamRoundOptions,
+): Promise<StreamRoundResult> {
+  const {
+    chatUrl,
+    apiKey,
+    model,
+    messages,
+    temperature = 0.7,
+    tools,
+    tool_choice,
+    signal: userSignal,
+    firstChunkMs = 30_000,
+    totalStreamMs = 300_000,
+    onTextDelta,
+  } = options;
+
+  const body: Record<string, unknown> = {
+    model,
+    temperature,
+    messages,
+    stream: true,
+  };
+  if (tools?.length) {
+    body.tools = tools;
+    if (tool_choice !== undefined) body.tool_choice = tool_choice;
+  }
+
+  const { signal, onFirstChunk, cleanup } = attachStreamTimeouts(userSignal, {
+    firstChunkMs,
+    totalMs: totalStreamMs,
+  });
+
+  let contentBuf = "";
+  const toolAcc = new Map<
+    number,
+    { id: string; name: string; arguments: string }
+  >();
+  let finishReason: string | null = null;
+
+  try {
+    const res = await fetchWithRetry(chatUrl, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${apiKey}`,
+      },
+      body: JSON.stringify(body),
+      signal,
+    });
+
+    for await (const line of readUtf8Lines(res.body)) {
+      const parsed = parseChatStreamSseLine(line);
+      if (!parsed) continue;
+      if (parsed.kind === "error") {
+        throw new Error(parsed.message);
+      }
+      if (parsed.kind === "done") break;
+
+      if (parsed.kind === "delta") {
+        if (parsed.content || parsed.toolCalls?.length) {
+          onFirstChunk();
+        }
+        if (parsed.content) {
+          contentBuf += parsed.content;
+          onTextDelta?.(parsed.content);
+        }
+        if (parsed.toolCalls?.length) {
+          mergeToolStreamDeltas(toolAcc, parsed.toolCalls);
+        }
+        if (
+          parsed.finishReason != null &&
+          String(parsed.finishReason).length > 0
+        ) {
+          finishReason = parsed.finishReason;
+        }
+      }
+    }
+  } finally {
+    cleanup();
+  }
+
+  const tool_calls = toolAccToCalls(toolAcc);
+  return {
+    message: {
+      role: "assistant",
+      content: contentBuf.length > 0 ? contentBuf : null,
+      tool_calls,
+    },
+    finish_reason: finishReason,
+  };
 }

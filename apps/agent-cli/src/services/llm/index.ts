@@ -2,10 +2,13 @@ export {
   chatCompletionsUrl,
   fetchNonStreaming,
   fetchStreaming,
+  streamChatCompletionRound,
 } from "./client.js";
 export type {
   FetchNonStreamingOptions,
   FetchStreamingOptions,
+  StreamRoundOptions,
+  StreamRoundResult,
 } from "./client.js";
 export type {
   ChatCompletionResult,
