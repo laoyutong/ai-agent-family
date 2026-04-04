@@ -29,8 +29,16 @@ export type RunWithToolsOptions = {
    * Spinner 旁短文案；可选追加一条结构化步骤（工具面板与对话历史共用）。
    */
   onStatus?: (update: RunStatusUpdate) => void;
-  /** 每一轮向模型发起流式请求前清空 UI 缓冲（避免多轮串台） */
+  /**
+   * 流式工具结构不完整、即将非流式补全时清空 UI 缓冲（丢弃不可靠的流式片段）。
+   * 不在每轮请求前或工具执行前调用，以便同一用户轮内保留已流式输出的正文。
+   */
   onStreamReset?: () => void;
+  /**
+   * 新一轮模型流式输出开始（round > 0，例如工具执行之后）。
+   * UI 可据此新开一列/一段，不与上一轮正文合并。
+   */
+  onStreamSegmentStart?: () => void;
   /** 当前轮模型正文增量（流式） */
   onStreamDelta?: (chunk: string) => void;
 };
@@ -96,7 +104,6 @@ export async function runWithTools(
 
   for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
     opts.signal.throwIfAborted();
-    opts.onStreamReset?.();
     opts.onStatus?.(
       round > 0
         ? {
@@ -105,6 +112,10 @@ export async function runWithTools(
           }
         : { spinnerHint: "请求模型…" },
     );
+
+    if (round > 0) {
+      opts.onStreamSegmentStart?.();
+    }
 
     let streamed = await streamChatCompletionRound({
       chatUrl: opts.chatUrl,
@@ -146,7 +157,6 @@ export async function runWithTools(
     }
 
     if (calls?.length) {
-      opts.onStreamReset?.();
       if (calls.length === 1) {
         const tc = calls[0]!;
         opts.onStatus?.({

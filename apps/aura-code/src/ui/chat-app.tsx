@@ -24,12 +24,52 @@ import { buildUserTranscriptPaddedRows } from "./user-transcript-rows.js";
 
 const MemoInfoPanel = memo(InfoPanel);
 
+/** 单行流式正文 + 可选光标（勿在 Text 内嵌套子 Text） */
+const StreamSegmentLine = memo(function StreamSegmentLine(props: {
+  text: string;
+  showCursor: boolean;
+}): React.JSX.Element {
+  return (
+    <Box flexDirection="row" alignItems="flex-start" width="100%">
+      <Box flexGrow={1} flexShrink={1}>
+        <Text wrap="wrap" color={theme.assistant}>
+          {props.text.length > 0 ? tightenTranscriptText(props.text) : ""}
+        </Text>
+      </Box>
+      {props.showCursor ? (
+        <Box flexShrink={0}>
+          <Text color={theme.hint}>▍</Text>
+        </Box>
+      ) : null}
+    </Box>
+  );
+});
+
 /** 收紧模型输出里的多余空行与行尾空白，减轻终端里段落间距过大的观感 */
 function tightenTranscriptText(text: string): string {
   return text
     .replace(/(?:\r?\n[ \t]*){2,}/g, "\n")
     .replace(/[ \t]+$/gm, "")
     .trim();
+}
+
+/**
+ * 本轮用户消息之后，按顺序收集各轮含正文的 assistant 片段（与 runWithTools 写入 messages 一致）。
+ */
+function collectAssistantBodySegments(
+  messages: ChatMessage[],
+  userMessageIndex: number,
+): string[] {
+  const out: string[] = [];
+  for (let i = userMessageIndex + 1; i < messages.length; i++) {
+    const m = messages[i]!;
+    if (m.role !== "assistant") continue;
+    const c = m.content;
+    if (c == null || typeof c !== "string") continue;
+    const t = c.trim();
+    if (t.length > 0) out.push(t);
+  }
+  return out;
 }
 
 /** 用户历史：按列宽折行，行尾补空格使背景在可视行上拉满；底色仅在有字符的 Text 行上 */
@@ -84,6 +124,8 @@ type TranscriptItem = {
   id: string;
   role: "user" | "assistant";
   text: string;
+  /** 多工具轮次时各段正文（展示顺序：首段 → 工具步骤 → 其余段）；单段时省略 */
+  assistantBodySegments?: string[];
   /** 该条助手回复对应的模型/工具步骤（追加记录，不覆盖） */
   steps?: AgentStep[];
 };
@@ -245,8 +287,13 @@ export function ChatApp({
     { role: "system", content: buildAgentSystem(options.systemPrompt, cwd) },
   ]);
   const [busy, setBusy] = useState(mode === "single");
-  /** 当前轮模型正在流式输出的正文（完成后会清空并入 transcript） */
-  const [streamText, setStreamText] = useState("");
+  /** 当前用户轮内各次模型回复的流式正文分段（不合并；工具后的正文在步骤下方另起一段） */
+  const [streamSegments, setStreamSegments] = useState<string[]>([]);
+  /**
+   * 首轮无正文、仅有工具后才开始流式时，onStreamSegmentStart 从 [] 推入一段；
+   * 此时正文应渲染在工具步骤下方。
+   */
+  const postToolSegmentOnlyRef = useRef(false);
   /** 进行中时 Spinner 旁的简短说明（不含工具全文） */
   const [phaseHint, setPhaseHint] = useState("处理中…");
   /** 合并展示：轮次分隔 / 失败条目 + 当前正在执行的工具（单行） */
@@ -273,7 +320,8 @@ export function ChatApp({
         { id: nextId(), role: "user", text: userText },
       ]);
       setBusy(true);
-      setStreamText("");
+      setStreamSegments([]);
+      postToolSegmentOnlyRef.current = false;
       stepLogRef.current = [];
       runningToolStepRef.current = null;
       setStepLog([]);
@@ -325,11 +373,28 @@ export function ChatApp({
                 : []),
             ]);
           },
+          /** 仅在不完整 tool_calls 需非流式补全时由引擎触发，清空当前段不可靠片段 */
           onStreamReset: () => {
-            setStreamText("");
+            setStreamSegments((prev) => {
+              if (prev.length === 0) return [];
+              const next = [...prev];
+              next[next.length - 1] = "";
+              return next;
+            });
+          },
+          onStreamSegmentStart: () => {
+            setStreamSegments((prev) => {
+              postToolSegmentOnlyRef.current = prev.length === 0;
+              return [...prev, ""];
+            });
           },
           onStreamDelta: (chunk) => {
-            setStreamText((prev) => prev + chunk);
+            setStreamSegments((prev) => {
+              if (prev.length === 0) return [chunk];
+              const next = [...prev];
+              next[next.length - 1] = (next[next.length - 1] ?? "") + chunk;
+              return next;
+            });
           },
         });
         const persistedSteps = stepLogRef.current.filter(
@@ -338,18 +403,28 @@ export function ChatApp({
             (s.tone === "invoke" &&
               (s.outcome !== undefined || s.invokeComplete)),
         );
+        const bodySegments = collectAssistantBodySegments(
+          messagesRef.current,
+          turnStartLen,
+        );
+        const transcriptText =
+          bodySegments.length > 0
+            ? bodySegments.join("\n\n")
+            : assistantText;
         setItems((prev) => [
           ...prev,
           {
             id: nextId(),
             role: "assistant",
-            text: assistantText,
+            text: transcriptText,
+            assistantBodySegments:
+              bodySegments.length > 1 ? bodySegments : undefined,
             steps:
               persistedSteps.length > 0 ? persistedSteps : undefined,
           },
         ]);
         // 轮次耗尽等：assistant 气泡已与 error 全文一致，不再叠一条红色框避免重复
-        if (error && error.trim() !== assistantText.trim()) {
+        if (error && error.trim() !== transcriptText.trim()) {
           setErrorBanner(error);
         }
       } catch (e) {
@@ -362,7 +437,7 @@ export function ChatApp({
         abortRef.current = null;
         setBusy(false);
         setPhaseHint("");
-        setStreamText("");
+        setStreamSegments([]);
         stepLogRef.current = [];
         runningToolStepRef.current = null;
         setStepLog([]);
@@ -438,16 +513,46 @@ export function ChatApp({
           ) : (
             <MessageCard key={row.id} role="assistant">
               <Box flexDirection="column" gap={0} width="100%">
-                {row.steps &&
-                row.steps.length > 0 &&
-                hasRenderableAgentSteps(row.steps) ? (
-                  <AssistantStepsBlock steps={row.steps} />
-                ) : null}
-                <Box flexDirection="column" gap={0}>
-                  <Text wrap="wrap" color={theme.assistant}>
-                    {tightenTranscriptText(row.text)}
-                  </Text>
-                </Box>
+                {row.assistantBodySegments &&
+                row.assistantBodySegments.length > 1 ? (
+                  <>
+                    <StreamSegmentLine
+                      text={row.assistantBodySegments[0] ?? ""}
+                      showCursor={false}
+                    />
+                    {row.steps &&
+                    row.steps.length > 0 &&
+                    hasRenderableAgentSteps(row.steps) ? (
+                      <AssistantStepsBlock steps={row.steps} />
+                    ) : null}
+                    {row.assistantBodySegments.slice(1).map((seg, j) => (
+                      <Box
+                        key={`${row.id}-seg-${j + 1}`}
+                        flexDirection="column"
+                        marginTop={1}
+                        width="100%"
+                      >
+                        <StreamSegmentLine
+                          text={seg}
+                          showCursor={false}
+                        />
+                      </Box>
+                    ))}
+                  </>
+                ) : (
+                  <>
+                    <Box flexDirection="column" gap={0}>
+                      <Text wrap="wrap" color={theme.assistant}>
+                        {tightenTranscriptText(row.text)}
+                      </Text>
+                    </Box>
+                    {row.steps &&
+                    row.steps.length > 0 &&
+                    hasRenderableAgentSteps(row.steps) ? (
+                      <AssistantStepsBlock steps={row.steps} />
+                    ) : null}
+                  </>
+                )}
               </Box>
             </MessageCard>
           )
@@ -457,37 +562,58 @@ export function ChatApp({
       {busy ? (
         <MessageCard role="assistant">
           <Box flexDirection="column" gap={0} width="100%">
-            {stepLog.length > 0 && hasRenderableAgentSteps(stepLog) ? (
-              <AssistantStepsBlock steps={stepLog} />
-            ) : null}
-            {streamText.length > 0 ? (
-              <Box flexDirection="column" gap={0} width="100%">
-                {/*
-                  勿在 <Text wrap> 内嵌套带样式的子 <Text>：Ink squash/wrap 与 log-update
-                  擦行在流式结束、转入 Static 时易错位。
-                */}
-                <Box flexDirection="row" alignItems="flex-start" width="100%">
-                  <Box flexGrow={1} flexShrink={1}>
-                    <Text wrap="wrap" color={theme.assistant}>
-                      {tightenTranscriptText(streamText)}
+            {(() => {
+              const hasSteps =
+                stepLog.length > 0 && hasRenderableAgentSteps(stepLog);
+              const postToolOnly =
+                postToolSegmentOnlyRef.current &&
+                streamSegments.length === 1 &&
+                hasSteps;
+              const lastI = streamSegments.length - 1;
+
+              if (streamSegments.length === 0) {
+                return (
+                  <Box flexDirection="row" flexWrap="wrap" alignItems="center">
+                    <Text color={theme.assistant}>
+                      <Spinner type="dots" />
+                    </Text>
+                    <Text color={theme.hint} wrap="wrap">
+                      {" "}
+                      {phaseHint || "处理中…"}
                     </Text>
                   </Box>
-                  <Box flexShrink={0}>
-                    <Text color={theme.hint}>▍</Text>
+                );
+              }
+
+              if (postToolOnly) {
+                return (
+                  <Box flexDirection="column" gap={0} width="100%">
+                    <AssistantStepsBlock steps={stepLog} />
+                    <StreamSegmentLine
+                      text={streamSegments[0] ?? ""}
+                      showCursor
+                    />
                   </Box>
+                );
+              }
+
+              return (
+                <Box flexDirection="column" gap={0} width="100%">
+                  <StreamSegmentLine
+                    text={streamSegments[0] ?? ""}
+                    showCursor={lastI === 0}
+                  />
+                  {hasSteps ? <AssistantStepsBlock steps={stepLog} /> : null}
+                  {streamSegments.slice(1).map((seg, j) => (
+                    <StreamSegmentLine
+                      key={j + 1}
+                      text={seg}
+                      showCursor={j + 1 === lastI}
+                    />
+                  ))}
                 </Box>
-              </Box>
-            ) : (
-              <Box flexDirection="row" flexWrap="wrap" alignItems="center">
-                <Text color={theme.assistant}>
-                  <Spinner type="dots" />
-                </Text>
-                <Text color={theme.hint} wrap="wrap">
-                  {" "}
-                  {phaseHint || "处理中…"}
-                </Text>
-              </Box>
-            )}
+              );
+            })()}
           </Box>
         </MessageCard>
       ) : null}
