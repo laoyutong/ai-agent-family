@@ -620,33 +620,45 @@ export function ChatApp({
           ) : (
             <Box key={row.id} flexDirection="column" width="100%" gap={0}>
               {row.assistantBlocks && row.assistantBlocks.length > 0 ? (
-                row.assistantBlocks.map((b, i) => {
-                  const kind: SegmentKind =
-                    b.kind === "text" ? "model" : "tools";
-                  const prevKind: SegmentKind | null =
-                    i === 0
-                      ? null
-                      : row.assistantBlocks![i - 1]!.kind === "text"
-                        ? "model"
-                        : "tools";
-                  return (
+                (() => {
+                  type AbPiece = {
+                    key: string;
+                    kind: SegmentKind;
+                    node: React.ReactNode;
+                  };
+                  const abPieces: AbPiece[] = [];
+                  row.assistantBlocks!.forEach((b, i) => {
+                    if (b.kind === "text") {
+                      if (!hasStreamText(b.text)) return;
+                      abPieces.push({
+                        key: `${row.id}-ab-${i}`,
+                        kind: "model",
+                        node: (
+                          <StreamSegmentLine
+                            text={b.text}
+                            showCursor={false}
+                          />
+                        ),
+                      });
+                    } else if (hasRenderableAgentSteps(b.steps)) {
+                      abPieces.push({
+                        key: `${row.id}-ab-${i}`,
+                        kind: "tools",
+                        node: <AssistantStepsBlock steps={b.steps} />,
+                      });
+                    }
+                  });
+                  return abPieces.map((p, i) => (
                     <AssistantSegmentCard
-                      key={`${row.id}-ab-${i}`}
+                      key={p.key}
                       index={i}
-                      kind={kind}
-                      prevKind={prevKind}
+                      kind={p.kind}
+                      prevKind={i === 0 ? null : abPieces[i - 1]!.kind}
                     >
-                      {b.kind === "text" ? (
-                        <StreamSegmentLine
-                          text={b.text}
-                          showCursor={false}
-                        />
-                      ) : (
-                        <AssistantStepsBlock steps={b.steps} />
-                      )}
+                      {p.node}
                     </AssistantSegmentCard>
-                  );
-                })
+                  ));
+                })()
               ) : useInterleavedAssistantLayout(row) ? (
                 (() => {
                   const segs = row.assistantBodySegments ?? [];
@@ -656,7 +668,7 @@ export function ChatApp({
                     node: React.ReactNode;
                   };
                   const pieces: Piece[] = [];
-                  if ((segs[0] ?? "").trim().length > 0) {
+                  if (hasStreamText(segs[0])) {
                     pieces.push({
                       key: `${row.id}-s0`,
                       kind: "model",
@@ -680,6 +692,7 @@ export function ChatApp({
                     });
                   }
                   segs.slice(1).forEach((seg, j) => {
+                    if (!hasStreamText(seg)) return;
                     pieces.push({
                       key: `${row.id}-s${j + 1}`,
                       kind: "model",
