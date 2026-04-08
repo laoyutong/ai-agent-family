@@ -55,7 +55,10 @@ function clipLogLine(s: string, max: number): string {
   return `${t.slice(0, Math.max(1, max - 1))}…`;
 }
 
-/** 默认关闭：与 Ink 内步骤块重复刷屏。调试时：`AURA_CODE_LOG_TOOLS=1` */
+/**
+ * 工具执行轨迹仅写 stderr，与 Ink 里「助手气泡」正文+步骤分离，避免终端里和对话区混成一团。
+ * 需要对照执行细节时：`AURA_CODE_LOG_TOOLS=1`。
+ */
 function toolTraceToStderr(): boolean {
   return process.env.AURA_CODE_LOG_TOOLS === "1";
 }

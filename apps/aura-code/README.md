@@ -1,6 +1,6 @@
 # aura-code
 
-光环代码：终端 AI 编程助手 — 受 [Claude Code](https://github.com/laoyutong/claude-code) 架构启发，基于 DeepSeek API 构建。
+aura-code: Terminal AI Programming Assistant — 受 [Claude Code](https://github.com/laoyutong/claude-code) 架构启发，基于 DeepSeek API 构建。
 
 ## 定位
 

@@ -9,6 +9,11 @@ import React, {
 import { Box, Static, Text, useApp, useInput, useStdout } from "ink";
 import Spinner from "ink-spinner";
 import type { ChatMessage } from "../services/llm/types.js";
+import {
+  buildAssistantTurnBlocks,
+  splitStepLogIntoToolGroups,
+  type AssistantTurnBlock,
+} from "../engine/assistant-turn-blocks.js";
 import { runWithTools } from "../engine/run-with-tools.js";
 import type { AgentStep } from "../engine/status-step.js";
 import {
@@ -24,16 +29,27 @@ import { buildUserTranscriptPaddedRows } from "./user-transcript-rows.js";
 
 const MemoInfoPanel = memo(InfoPanel);
 
-/** 单行流式正文 + 可选光标（勿在 Text 内嵌套子 Text） */
+/** 流式正文行 + 可选光标；无正文则不渲染（避免 ◆ 独占一行或空行占位） */
 const StreamSegmentLine = memo(function StreamSegmentLine(props: {
   text: string;
   showCursor: boolean;
-}): React.JSX.Element {
+}): React.JSX.Element | null {
+  const body = tightenTranscriptText(props.text);
+  if (body.length === 0) {
+    return null;
+  }
   return (
-    <Box flexDirection="row" alignItems="flex-start" width="100%">
+    <Box
+      flexDirection="row"
+      alignItems="flex-start"
+      width="100%"
+      gap={0}
+      rowGap={0}
+      columnGap={0}
+    >
       <Box flexGrow={1} flexShrink={1}>
         <Text wrap="wrap" color={theme.assistant}>
-          {props.text.length > 0 ? tightenTranscriptText(props.text) : ""}
+          {body}
         </Text>
       </Box>
       {props.showCursor ? (
@@ -45,31 +61,21 @@ const StreamSegmentLine = memo(function StreamSegmentLine(props: {
   );
 });
 
-/** 收紧模型输出里的多余空行与行尾空白，减轻终端里段落间距过大的观感 */
-function tightenTranscriptText(text: string): string {
-  return text
-    .replace(/(?:\r?\n[ \t]*){2,}/g, "\n")
-    .replace(/[ \t]+$/gm, "")
-    .trim();
+function hasStreamText(seg: string | undefined): boolean {
+  return tightenTranscriptText(seg ?? "").length > 0;
 }
 
 /**
- * 本轮用户消息之后，按顺序收集各轮含正文的 assistant 片段（与 runWithTools 写入 messages 一致）。
+ * 收紧模型输出：统一换行符、合并连续空行、去行尾空白。
+ * 避免 `\r\n`/嵌套 `\n` 在 Ink 里被量成「多一行高度」从而在终端里显得行距很大。
  */
-function collectAssistantBodySegments(
-  messages: ChatMessage[],
-  userMessageIndex: number,
-): string[] {
-  const out: string[] = [];
-  for (let i = userMessageIndex + 1; i < messages.length; i++) {
-    const m = messages[i]!;
-    if (m.role !== "assistant") continue;
-    const c = m.content;
-    if (c == null || typeof c !== "string") continue;
-    const t = c.trim();
-    if (t.length > 0) out.push(t);
-  }
-  return out;
+function tightenTranscriptText(text: string): string {
+  return text
+    .replace(/\r\n/g, "\n")
+    .replace(/\r/g, "\n")
+    .replace(/(?:\n[ \t]*){2,}/g, "\n")
+    .replace(/[ \t]+$/gm, "")
+    .trim();
 }
 
 /** 用户历史：按列宽折行，行尾补空格使背景在可视行上拉满；底色仅在有字符的 Text 行上 */
@@ -106,7 +112,13 @@ const UserTranscriptLines = memo(function UserTranscriptLines(props: {
 
   if (rows.length === 0) return null;
   return (
-    <Box flexDirection="column" gap={0} width="100%">
+    <Box
+      flexDirection="column"
+      gap={0}
+      rowGap={0}
+      columnGap={0}
+      width="100%"
+    >
       {rows.map((row, i) => (
         <Text
           key={i}
@@ -124,9 +136,15 @@ type TranscriptItem = {
   id: string;
   role: "user" | "assistant";
   text: string;
-  /** 多工具轮次时各段正文（展示顺序：首段 → 工具步骤 → 其余段）；单段时省略 */
+  /**
+   * 各段正文（穿插顺序：非空首段 → 工具步骤 → 其余段）；首段可为 "" 表示「先工具后文」。
+   * 无工具且仅一段时可省略，用 `text` 即可。
+   * @deprecated 新会话用 `assistantBlocks`
+   */
   assistantBodySegments?: string[];
-  /** 该条助手回复对应的模型/工具步骤（追加记录，不覆盖） */
+  /** 按时间穿插：模型正文块与工具块交替（优先于 assistantBodySegments + steps） */
+  assistantBlocks?: AssistantTurnBlock[];
+  /** @deprecated 新会话用 `assistantBlocks` */
   steps?: AgentStep[];
 };
 
@@ -146,12 +164,66 @@ function hasRenderableAgentSteps(steps: AgentStep[]): boolean {
   return steps.some((s) => s.tone !== "round");
 }
 
-/** 助手消息内工具步骤：与正文同一 MessageCard，无独立边框 */
+/**
+ * 是否用「首段/中段工具/后段」穿插布局：多段正文，或单段但本轮有工具（避免单段时画成「全文在上、工具在下」错位）。
+ */
+function useInterleavedAssistantLayout(row: TranscriptItem): boolean {
+  const segs = row.assistantBodySegments;
+  if (!segs || segs.length === 0) return false;
+  if (segs.length > 1) return true;
+  return Boolean(
+    row.steps &&
+      row.steps.length > 0 &&
+      hasRenderableAgentSteps(row.steps),
+  );
+}
+
+/** Spinner 文案与步骤列表重复（步骤里已有运行态/并行说明）时省略第二行 */
+function phaseDuplicatesStepPanel(phaseHint: string, hasSteps: boolean): boolean {
+  if (!hasSteps) return false;
+  const t = phaseHint.trim();
+  return t.includes("· 运行") || /^并行 \d+ 个工具$/.test(t);
+}
+
+type SegmentKind = "model" | "tools";
+
+/** 每一段助手输出单独一块；连续多段工具之间不加空行（model↔tool 仍隔开） */
+function AssistantSegmentCard(props: {
+  index: number;
+  kind: SegmentKind;
+  prevKind: SegmentKind | null;
+  children: React.ReactNode;
+}): React.JSX.Element {
+  const gapTop =
+    props.index > 0 &&
+    !(props.prevKind === "tools" && props.kind === "tools")
+      ? 1
+      : 0;
+  return (
+    <Box marginTop={gapTop} width="100%">
+      <MessageCard
+        role="assistant"
+        assistantVariant={props.kind === "tools" ? "tools" : "content"}
+      >
+        {props.children}
+      </MessageCard>
+    </Box>
+  );
+}
+
+/** 工具步骤列表（外层 MessageCard 仅 ◇ 与模型 ◆ 不同） */
 const AssistantStepsBlock = memo(function AssistantStepsBlock(props: {
   steps: AgentStep[];
 }): React.JSX.Element {
   return (
-    <Box flexDirection="column" gap={0} marginBottom={0} width="100%">
+    <Box
+      flexDirection="column"
+      gap={0}
+      rowGap={0}
+      columnGap={0}
+      marginBottom={0}
+      width="100%"
+    >
       <AgentStepList steps={props.steps} compact />
     </Box>
   );
@@ -159,12 +231,15 @@ const AssistantStepsBlock = memo(function AssistantStepsBlock(props: {
 
 const MessageCard = memo(function MessageCard(props: {
   role: "user" | "assistant";
+  /** 助手：模型正文 ◆ / 工具块 ◇ */
+  assistantVariant?: "content" | "tools";
   children: React.ReactNode;
 }): React.JSX.Element {
   const isUser = props.role === "user";
+  const isToolAssistant =
+    props.role === "assistant" && props.assistantVariant === "tools";
   const accent = isUser ? theme.user : theme.assistant;
-  /** 用户 ● / 助手 ◆：形状不同，不只靠颜色 */
-  const glyph = isUser ? "●" : "◆";
+  const glyph = isUser ? "●" : isToolAssistant ? "◇" : "◆";
   return (
     <Box
       flexDirection="row"
@@ -184,6 +259,8 @@ const MessageCard = memo(function MessageCard(props: {
         flexShrink={1}
         flexDirection="column"
         gap={0}
+        rowGap={0}
+        columnGap={0}
         width="100%"
         minWidth={0}
         paddingY={0}
@@ -210,6 +287,28 @@ function stepToneStyle(tone: AgentStep["tone"]) {
   }
 }
 
+/** 与 tightenTranscriptText 一致；工具回包常带多空行，易把条目「撑开」 */
+function softenToolBody(text: string): string {
+  return tightenTranscriptText(text);
+}
+
+/** 详情/结果挂在 title 下时统一左缩进（避免多一层 Box 拉高 flex 行距） */
+function indentSubBlock(text: string, spaces: string): string {
+  const t = softenToolBody(text);
+  if (!t) return t;
+  return t
+    .split("\n")
+    .map((line) => spaces + line)
+    .join("\n");
+}
+
+/** 工具标题内换行易在终端里顶出「空行」，压成单行展示 */
+function toolTitleOneLine(s: string): string {
+  return softenToolBody(s).replace(/\n+/g, " ").trim();
+}
+
+const SUB_INDENT = "  ";
+
 const AgentStepList = memo(function AgentStepList({
   steps,
   compact = false,
@@ -217,56 +316,61 @@ const AgentStepList = memo(function AgentStepList({
   steps: AgentStep[];
   compact?: boolean;
 }): React.JSX.Element {
-  let toolIdx = 0;
-  return (
-    <Box flexDirection="column" gap={0} marginBottom={compact ? 0 : 1} width="100%">
-      {steps.map((step, i) => {
-        if (step.tone === "round") {
-          return null;
-        }
+  const visible = steps
+    .map((step, i) => ({ step, i }))
+    .filter(({ step }) => step.tone !== "round");
 
-        toolIdx += 1;
+  return (
+    <Box
+      flexDirection="column"
+      gap={0}
+      rowGap={0}
+      columnGap={0}
+      marginBottom={compact ? 0 : 1}
+      width="100%"
+    >
+      {visible.map(({ step, i }) => {
         const { glyph, color } = stepToneStyle(step.tone);
-        const n = `${toolIdx}.`;
-        const indexColW = n.length + 1;
-        const stepNestPad = indexColW + 2;
         const outcomeErr =
           step.outcome &&
           (/^执行结果：错误：/.test(step.outcome) ||
             step.outcome.trimStart().startsWith("错误："));
         const rowKey = `${step.toolCallId ?? "s"}-${i}`;
         return (
-          <Box key={rowKey} flexDirection="column" marginTop={0}>
-            <Box flexDirection="row" alignItems="flex-start">
-              <Box flexShrink={0}>
-                <Text dimColor>{n} </Text>
-              </Box>
-              <Box flexGrow={1} flexShrink={1}>
-                <Text wrap="wrap" color={color}>
-                  {glyph}
-                  {step.title}
-                </Text>
-              </Box>
+          <Box
+            key={rowKey}
+            flexDirection="column"
+            gap={0}
+            rowGap={0}
+            columnGap={0}
+            width="100%"
+            marginTop={0}
+            marginBottom={0}
+            paddingY={0}
+          >
+            <Box flexGrow={1} flexShrink={1} width="100%">
+              <Text wrap="wrap" color={color}>
+                {glyph}
+                {toolTitleOneLine(step.title)}
+              </Text>
             </Box>
-            {step.detail ? (
-              <Box paddingLeft={stepNestPad}>
-                <Text dimColor wrap="wrap">
-                  {step.detail}
-                </Text>
-              </Box>
+            {step.detail &&
+            indentSubBlock(step.detail, SUB_INDENT).length > 0 ? (
+              <Text dimColor wrap="wrap">
+                {indentSubBlock(step.detail, SUB_INDENT)}
+              </Text>
             ) : null}
-            {step.outcome ? (
-              <Box paddingLeft={stepNestPad}>
-                {outcomeErr ? (
-                  <Text color={theme.error} wrap="wrap">
-                    {step.outcome}
-                  </Text>
-                ) : (
-                  <Text wrap="wrap" color={theme.assistant}>
-                    {step.outcome}
-                  </Text>
-                )}
-              </Box>
+            {step.outcome &&
+            indentSubBlock(step.outcome, SUB_INDENT).length > 0 ? (
+              outcomeErr ? (
+                <Text color={theme.error} wrap="wrap">
+                  {indentSubBlock(step.outcome, SUB_INDENT)}
+                </Text>
+              ) : (
+                <Text wrap="wrap" color={theme.assistant}>
+                  {indentSubBlock(step.outcome, SUB_INDENT)}
+                </Text>
+              )
             ) : null}
           </Box>
         );
@@ -290,10 +394,10 @@ export function ChatApp({
   /** 当前用户轮内各次模型回复的流式正文分段（不合并；工具后的正文在步骤下方另起一段） */
   const [streamSegments, setStreamSegments] = useState<string[]>([]);
   /**
-   * 首轮无正文、仅有工具后才开始流式时，onStreamSegmentStart 从 [] 推入一段；
-   * 此时正文应渲染在工具步骤下方。
+   * 本段流式开始时：若当前用户轮内已经有过工具步骤，则这一段是「工具之后的正文」，
+   * 布局应为 步骤 → 正文（而非 正文 → 步骤）。
    */
-  const postToolSegmentOnlyRef = useRef(false);
+  const postToolsFirstSegmentRef = useRef(false);
   /** 进行中时 Spinner 旁的简短说明（不含工具全文） */
   const [phaseHint, setPhaseHint] = useState("处理中…");
   /** 合并展示：轮次分隔 / 失败条目 + 当前正在执行的工具（单行） */
@@ -321,7 +425,7 @@ export function ChatApp({
       ]);
       setBusy(true);
       setStreamSegments([]);
-      postToolSegmentOnlyRef.current = false;
+      postToolsFirstSegmentRef.current = false;
       stepLogRef.current = [];
       runningToolStepRef.current = null;
       setStepLog([]);
@@ -384,7 +488,10 @@ export function ChatApp({
           },
           onStreamSegmentStart: () => {
             setStreamSegments((prev) => {
-              postToolSegmentOnlyRef.current = prev.length === 0;
+              const toolsAlready =
+                hasRenderableAgentSteps(stepLogRef.current) ||
+                runningToolStepRef.current != null;
+              postToolsFirstSegmentRef.current = prev.length === 0 && toolsAlready;
               return [...prev, ""];
             });
           },
@@ -397,30 +504,23 @@ export function ChatApp({
             });
           },
         });
-        const persistedSteps = stepLogRef.current.filter(
-          (s) =>
-            s.tone === "fail" ||
-            (s.tone === "invoke" &&
-              (s.outcome !== undefined || s.invokeComplete)),
-        );
-        const bodySegments = collectAssistantBodySegments(
+        const assistantBlocks = buildAssistantTurnBlocks(
           messagesRef.current,
           turnStartLen,
         );
         const transcriptText =
-          bodySegments.length > 0
-            ? bodySegments.join("\n\n")
-            : assistantText;
+          assistantBlocks
+            .filter((b): b is { kind: "text"; text: string } => b.kind === "text")
+            .map((b) => b.text)
+            .join("\n\n") || assistantText;
+        const hasToolBlocks = assistantBlocks.some((b) => b.kind === "tools");
         setItems((prev) => [
           ...prev,
           {
             id: nextId(),
             role: "assistant",
             text: transcriptText,
-            assistantBodySegments:
-              bodySegments.length > 1 ? bodySegments : undefined,
-            steps:
-              persistedSteps.length > 0 ? persistedSteps : undefined,
+            assistantBlocks: hasToolBlocks ? assistantBlocks : undefined,
           },
         ]);
         // 轮次耗尽等：assistant 气泡已与 error 全文一致，不再叠一条红色框避免重复
@@ -501,7 +601,14 @@ export function ChatApp({
   }, [items]);
 
   return (
-    <Box flexDirection="column" paddingX={1} gap={0} width="100%">
+    <Box
+      flexDirection="column"
+      paddingX={1}
+      gap={0}
+      rowGap={0}
+      columnGap={0}
+      width="100%"
+    >
       <Static items={staticFeed}>
         {(row) =>
           row.kind === "intro" ? (
@@ -511,112 +618,229 @@ export function ChatApp({
               <UserTranscriptLines text={row.text} />
             </MessageCard>
           ) : (
-            <MessageCard key={row.id} role="assistant">
-              <Box flexDirection="column" gap={0} width="100%">
-                {row.assistantBodySegments &&
-                row.assistantBodySegments.length > 1 ? (
-                  <>
-                    <StreamSegmentLine
-                      text={row.assistantBodySegments[0] ?? ""}
-                      showCursor={false}
-                    />
-                    {row.steps &&
+            <Box key={row.id} flexDirection="column" width="100%" gap={0}>
+              {row.assistantBlocks && row.assistantBlocks.length > 0 ? (
+                row.assistantBlocks.map((b, i) => {
+                  const kind: SegmentKind =
+                    b.kind === "text" ? "model" : "tools";
+                  const prevKind: SegmentKind | null =
+                    i === 0
+                      ? null
+                      : row.assistantBlocks![i - 1]!.kind === "text"
+                        ? "model"
+                        : "tools";
+                  return (
+                    <AssistantSegmentCard
+                      key={`${row.id}-ab-${i}`}
+                      index={i}
+                      kind={kind}
+                      prevKind={prevKind}
+                    >
+                      {b.kind === "text" ? (
+                        <StreamSegmentLine
+                          text={b.text}
+                          showCursor={false}
+                        />
+                      ) : (
+                        <AssistantStepsBlock steps={b.steps} />
+                      )}
+                    </AssistantSegmentCard>
+                  );
+                })
+              ) : useInterleavedAssistantLayout(row) ? (
+                (() => {
+                  const segs = row.assistantBodySegments ?? [];
+                  type Piece = {
+                    key: string;
+                    kind: SegmentKind;
+                    node: React.ReactNode;
+                  };
+                  const pieces: Piece[] = [];
+                  if ((segs[0] ?? "").trim().length > 0) {
+                    pieces.push({
+                      key: `${row.id}-s0`,
+                      kind: "model",
+                      node: (
+                        <StreamSegmentLine
+                          text={segs[0] ?? ""}
+                          showCursor={false}
+                        />
+                      ),
+                    });
+                  }
+                  if (
+                    row.steps &&
                     row.steps.length > 0 &&
-                    hasRenderableAgentSteps(row.steps) ? (
-                      <AssistantStepsBlock steps={row.steps} />
-                    ) : null}
-                    {row.assistantBodySegments.slice(1).map((seg, j) => (
-                      <Box
-                        key={`${row.id}-seg-${j + 1}`}
-                        flexDirection="column"
-                        marginTop={1}
-                        width="100%"
-                      >
+                    hasRenderableAgentSteps(row.steps)
+                  ) {
+                    pieces.push({
+                      key: `${row.id}-st`,
+                      kind: "tools",
+                      node: <AssistantStepsBlock steps={row.steps} />,
+                    });
+                  }
+                  segs.slice(1).forEach((seg, j) => {
+                    pieces.push({
+                      key: `${row.id}-s${j + 1}`,
+                      kind: "model",
+                      node: (
                         <StreamSegmentLine
                           text={seg}
                           showCursor={false}
                         />
-                      </Box>
-                    ))}
-                  </>
-                ) : (
-                  <>
-                    <Box flexDirection="column" gap={0}>
+                      ),
+                    });
+                  });
+                  return pieces.map((p, i) => (
+                    <AssistantSegmentCard
+                      key={p.key}
+                      index={i}
+                      kind={p.kind}
+                      prevKind={i === 0 ? null : pieces[i - 1]!.kind}
+                    >
+                      {p.node}
+                    </AssistantSegmentCard>
+                  ));
+                })()
+              ) : (
+                <>
+                  <AssistantSegmentCard
+                    index={0}
+                    kind="model"
+                    prevKind={null}
+                  >
+                    <Box flexDirection="column" gap={0} width="100%">
                       <Text wrap="wrap" color={theme.assistant}>
                         {tightenTranscriptText(row.text)}
                       </Text>
                     </Box>
-                    {row.steps &&
-                    row.steps.length > 0 &&
-                    hasRenderableAgentSteps(row.steps) ? (
+                  </AssistantSegmentCard>
+                  {row.steps &&
+                  row.steps.length > 0 &&
+                  hasRenderableAgentSteps(row.steps) ? (
+                    <AssistantSegmentCard
+                      index={1}
+                      kind="tools"
+                      prevKind="model"
+                    >
                       <AssistantStepsBlock steps={row.steps} />
-                    ) : null}
-                  </>
-                )}
-              </Box>
-            </MessageCard>
+                    </AssistantSegmentCard>
+                  ) : null}
+                </>
+              )}
+            </Box>
           )
         }
       </Static>
 
-      {busy ? (
-        <MessageCard role="assistant">
-          <Box flexDirection="column" gap={0} width="100%">
-            {(() => {
-              const hasSteps =
-                stepLog.length > 0 && hasRenderableAgentSteps(stepLog);
-              const postToolOnly =
-                postToolSegmentOnlyRef.current &&
-                streamSegments.length === 1 &&
-                hasSteps;
-              const lastI = streamSegments.length - 1;
+      {busy
+        ? (() => {
+            const groups = splitStepLogIntoToolGroups(stepLog);
+            const S = streamSegments.length;
+            const G = groups.length;
+            const postFirst = postToolsFirstSegmentRef.current;
+            const lastI = S - 1;
+            const hasStepsForPhase =
+              G > 0 && groups.some((g) => hasRenderableAgentSteps(g));
+            const showPhaseRow =
+              !phaseDuplicatesStepPanel(phaseHint, hasStepsForPhase);
 
-              if (streamSegments.length === 0) {
-                return (
-                  <Box flexDirection="row" flexWrap="wrap" alignItems="center">
-                    <Text color={theme.assistant}>
-                      <Spinner type="dots" />
-                    </Text>
-                    <Text color={theme.hint} wrap="wrap">
-                      {" "}
-                      {phaseHint || "处理中…"}
-                    </Text>
-                  </Box>
-                );
+            type LivePart = { kind: SegmentKind; node: React.ReactNode };
+            const pieces: LivePart[] = [];
+
+            if (S === 0) {
+              for (let j = 0; j < G; j++) {
+                pieces.push({
+                  kind: "tools",
+                  node: <AssistantStepsBlock steps={groups[j]!} />,
+                });
               }
-
-              if (postToolOnly) {
-                return (
-                  <Box flexDirection="column" gap={0} width="100%">
-                    <AssistantStepsBlock steps={stepLog} />
-                    <StreamSegmentLine
-                      text={streamSegments[0] ?? ""}
-                      showCursor
-                    />
-                  </Box>
-                );
+              if (showPhaseRow) {
+                pieces.push({
+                  kind: "model",
+                  node: (
+                    <Box
+                      flexDirection="row"
+                      flexWrap="wrap"
+                      alignItems="center"
+                      width="100%"
+                    >
+                      <Text color={theme.assistant}>
+                        <Spinner type="dots" />
+                      </Text>
+                      <Text color={theme.hint} wrap="wrap">
+                        {" "}
+                        {phaseHint || "处理中…"}
+                      </Text>
+                    </Box>
+                  ),
+                });
               }
+            } else if (postFirst) {
+              const maxJ = Math.max(S, G);
+              for (let j = 0; j < maxJ; j++) {
+                if (j < G) {
+                  pieces.push({
+                    kind: "tools",
+                    node: <AssistantStepsBlock steps={groups[j]!} />,
+                  });
+                }
+                if (j < S && hasStreamText(streamSegments[j])) {
+                  pieces.push({
+                    kind: "model",
+                    node: (
+                      <StreamSegmentLine
+                        text={streamSegments[j] ?? ""}
+                        showCursor={j === lastI}
+                      />
+                    ),
+                  });
+                }
+              }
+            } else {
+              for (let j = 0; j < S; j++) {
+                if (hasStreamText(streamSegments[j])) {
+                  pieces.push({
+                    kind: "model",
+                    node: (
+                      <StreamSegmentLine
+                        text={streamSegments[j] ?? ""}
+                        showCursor={j === lastI}
+                      />
+                    ),
+                  });
+                }
+                if (j < G) {
+                  pieces.push({
+                    kind: "tools",
+                    node: <AssistantStepsBlock steps={groups[j]!} />,
+                  });
+                }
+              }
+              for (let j = S; j < G; j++) {
+                pieces.push({
+                  kind: "tools",
+                  node: <AssistantStepsBlock steps={groups[j]!} />,
+                });
+              }
+            }
 
-              return (
-                <Box flexDirection="column" gap={0} width="100%">
-                  <StreamSegmentLine
-                    text={streamSegments[0] ?? ""}
-                    showCursor={lastI === 0}
-                  />
-                  {hasSteps ? <AssistantStepsBlock steps={stepLog} /> : null}
-                  {streamSegments.slice(1).map((seg, j) => (
-                    <StreamSegmentLine
-                      key={j + 1}
-                      text={seg}
-                      showCursor={j + 1 === lastI}
-                    />
-                  ))}
-                </Box>
-              );
-            })()}
-          </Box>
-        </MessageCard>
-      ) : null}
+            return (
+              <Box flexDirection="column" width="100%" gap={0}>
+                {pieces.map((p, i) => (
+                  <AssistantSegmentCard
+                    key={`live-seg-${i}`}
+                    index={i}
+                    kind={p.kind}
+                    prevKind={i === 0 ? null : pieces[i - 1]!.kind}
+                  >
+                    {p.node}
+                  </AssistantSegmentCard>
+                ))}
+              </Box>
+            );
+          })()
+        : null}
 
       {errorBanner ? (
         <Box

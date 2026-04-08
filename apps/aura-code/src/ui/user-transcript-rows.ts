@@ -13,7 +13,9 @@ export function userMessageInnerWidth(columns: number): number {
 
 function tightenTranscriptBody(text: string): string {
   return text
-    .replace(/(?:\r?\n[ \t]*){2,}/g, "\n")
+    .replace(/\r\n/g, "\n")
+    .replace(/\r/g, "\n")
+    .replace(/(?:\n[ \t]*){2,}/g, "\n")
     .replace(/[ \t]+$/gm, "")
     .trim();
 }
