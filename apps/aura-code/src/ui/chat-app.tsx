@@ -6,6 +6,7 @@ import React, {
   useRef,
   useState,
 } from "react";
+import { buildAnimatedLoadingCaption } from "./loading-hint.js";
 import { Box, Static, Text, useApp, useInput, useStdout } from "ink";
 import Spinner from "ink-spinner";
 import type { ChatMessage } from "../services/llm/types.js";
@@ -185,6 +186,49 @@ function phaseDuplicatesStepPanel(phaseHint: string, hasSteps: boolean): boolean
   return t.includes("· 运行") || /^并行 \d+ 个工具$/.test(t);
 }
 
+/** 工具调用已下发、尚未收到结果（与 invokeComplete / outcome 区分） */
+function isAgentStepInvokeRunning(step: AgentStep): boolean {
+  return (
+    step.tone === "invoke" &&
+    step.invokeComplete !== true &&
+    step.outcome === undefined
+  );
+}
+
+/** 底部「Spinner + 阶段说明」；工具执行、补全、等模型时复用 */
+const BusyPhaseFooter = memo(function BusyPhaseFooter(props: {
+  hint: string;
+}): React.JSX.Element {
+  const phaseKey = props.hint;
+  const [elapsedSec, setElapsedSec] = useState(0);
+  useEffect(() => {
+    setElapsedSec(0);
+  }, [phaseKey]);
+  useEffect(() => {
+    const id = setInterval(() => {
+      setElapsedSec((s) => s + 1);
+    }, 1000);
+    return () => clearInterval(id);
+  }, [phaseKey]);
+  const label = buildAnimatedLoadingCaption(props.hint, elapsedSec);
+  return (
+    <Box
+      flexDirection="row"
+      flexWrap="wrap"
+      alignItems="center"
+      width="100%"
+    >
+      <Text color={theme.assistant}>
+        <Spinner type="dots" />
+      </Text>
+      <Text color={theme.hint} wrap="wrap">
+        {" "}
+        {label}
+      </Text>
+    </Box>
+  );
+});
+
 type SegmentKind = "model" | "tools";
 
 /** 每一段助手输出单独一块；连续多段工具之间不加空行（model↔tool 仍隔开） */
@@ -331,6 +375,7 @@ const AgentStepList = memo(function AgentStepList({
     >
       {visible.map(({ step, i }) => {
         const { glyph, color } = stepToneStyle(step.tone);
+        const invokeRunning = isAgentStepInvokeRunning(step);
         const outcomeErr =
           step.outcome &&
           (/^执行结果：错误：/.test(step.outcome) ||
@@ -348,11 +393,27 @@ const AgentStepList = memo(function AgentStepList({
             marginBottom={0}
             paddingY={0}
           >
-            <Box flexGrow={1} flexShrink={1} width="100%">
-              <Text wrap="wrap" color={color}>
-                {glyph}
-                {toolTitleOneLine(step.title)}
-              </Text>
+            <Box
+              flexDirection="row"
+              flexWrap="wrap"
+              alignItems="center"
+              flexGrow={1}
+              flexShrink={1}
+              width="100%"
+            >
+              {invokeRunning ? (
+                <Box flexShrink={0} marginRight={1}>
+                  <Text color={theme.assistant}>
+                    <Spinner type="dots" />
+                  </Text>
+                </Box>
+              ) : null}
+              <Box flexGrow={1} flexShrink={1} minWidth={0}>
+                <Text wrap="wrap" color={color}>
+                  {glyph}
+                  {toolTitleOneLine(step.title)}
+                </Text>
+              </Box>
             </Box>
             {step.detail &&
             indentSubBlock(step.detail, SUB_INDENT).length > 0 ? (
@@ -771,22 +832,7 @@ export function ChatApp({
               if (showPhaseRow) {
                 pieces.push({
                   kind: "model",
-                  node: (
-                    <Box
-                      flexDirection="row"
-                      flexWrap="wrap"
-                      alignItems="center"
-                      width="100%"
-                    >
-                      <Text color={theme.assistant}>
-                        <Spinner type="dots" />
-                      </Text>
-                      <Text color={theme.hint} wrap="wrap">
-                        {" "}
-                        {phaseHint || "处理中…"}
-                      </Text>
-                    </Box>
-                  ),
+                  node: <BusyPhaseFooter hint={phaseHint || "处理中…"} />,
                 });
               }
             } else if (postFirst) {
@@ -838,6 +884,12 @@ export function ChatApp({
               }
             }
 
+            const appendPhaseFooter =
+              S > 0 &&
+              phaseHint.trim().length > 0 &&
+              !phaseDuplicatesStepPanel(phaseHint, hasStepsForPhase);
+            const tailIndex = pieces.length;
+
             return (
               <Box flexDirection="column" width="100%" gap={0}>
                 {pieces.map((p, i) => (
@@ -850,6 +902,18 @@ export function ChatApp({
                     {p.node}
                   </AssistantSegmentCard>
                 ))}
+                {appendPhaseFooter ? (
+                  <AssistantSegmentCard
+                    key="live-phase-footer"
+                    index={tailIndex}
+                    kind="model"
+                    prevKind={
+                      tailIndex === 0 ? null : pieces[tailIndex - 1]!.kind
+                    }
+                  >
+                    <BusyPhaseFooter hint={phaseHint} />
+                  </AssistantSegmentCard>
+                ) : null}
               </Box>
             );
           })()

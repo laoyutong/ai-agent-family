@@ -52,6 +52,11 @@ function toolLabel(name: string): string {
   return TOOL_LABEL[name] ?? name;
 }
 
+/** 工具 API 名在 UI 中的短标签（与步骤列表一致） */
+export function toolApiShortLabel(name: string): string {
+  return toolLabel(name);
+}
+
 /** 「执行xxx工具 / xxx工具的执行结果」中的 xxx（简短名） */
 const TOOL_EXECUTE_NOUN: Record<string, string> = {
   run_command: "Shell",
