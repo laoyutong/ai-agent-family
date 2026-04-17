@@ -1,12 +1,12 @@
 # aura-code
 
-aura-code: Terminal AI Programming Assistant — 受 [Claude Code](https://github.com/laoyutong/claude-code) 架构启发，基于 DeepSeek API 构建。
+aura-code: Terminal AI Programming Assistant — 基于 DeepSeek API 构建的终端编程助手。
 
 ## 定位
 
 一个运行在终端的 **agentic coding assistant**：用户用自然语言描述任务，LLM 自主调用工具（读写文件、执行命令、搜索代码）完成编程工作。
 
-核心架构映射自 Claude Code 的开源快照（~1,900 文件、512K+ 行），但做了大量简化与裁剪，适配 DeepSeek API 和本 monorepo 技术栈。详细架构设计和分阶段实现计划见 [ROADMAP.md](./ROADMAP.md)。
+aura-code 是一个完整的终端编程助手实现，具备完整的工具系统和命令系统，支持复杂的编程任务。
 
 ## 状态
 

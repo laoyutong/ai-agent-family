@@ -1,4 +1,5 @@
 import type { OpenAITool, ToolCall } from "../services/llm/types.js";
+import type { ToolPermissionLevel } from "../types/index.js";
 import { runBash } from "./bash.js";
 import { runGlobFiles } from "./glob-files.js";
 import { runGrepContent } from "./grep-content.js";
@@ -7,6 +8,26 @@ import { runSearchReplace } from "./search-replace.js";
 import { runWriteFile } from "./write-file.js";
 
 export const MAX_TOOL_ROUNDS = 64;
+
+/** 工具权限级别定义 */
+export const TOOL_PERMISSIONS: Record<string, ToolPermissionLevel> = {
+  read_file: "safe",
+  glob_files: "safe",
+  grep_content: "safe",
+  write_file: "dangerous",
+  search_replace: "dangerous",
+  run_command: "dangerous",
+};
+
+/** 获取工具的权限级别 */
+export function getToolPermissionLevel(toolName: string): ToolPermissionLevel {
+  return TOOL_PERMISSIONS[toolName] ?? "dangerous";
+}
+
+/** 判断工具是否需要用户确认 */
+export function toolRequiresConfirmation(toolName: string): boolean {
+  return getToolPermissionLevel(toolName) === "dangerous";
+}
 
 export function getDefaultTools(): OpenAITool[] {
   return [

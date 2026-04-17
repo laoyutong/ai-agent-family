@@ -15,8 +15,19 @@ import {
   formatToolRunning,
   type RunStatusUpdate,
 } from "./status-step.js";
+import type { PendingPermissionRequest } from "../types/index.js";
+import {
+  createPermissionRequest,
+  getPermissionMode,
+  shouldRequestConfirmation,
+} from "./permissions.js";
 
 export type { AgentStep, RunStatusUpdate } from "./status-step.js";
+
+/**
+ * 权限确认回调类型
+ */
+export type PermissionCallback = (description: string) => Promise<boolean>;
 
 export type RunWithToolsOptions = {
   chatUrl: string;
@@ -41,6 +52,14 @@ export type RunWithToolsOptions = {
   onStreamSegmentStart?: () => void;
   /** 当前轮模型正文增量（流式） */
   onStreamDelta?: (chunk: string) => void;
+  /**
+   * 请求用户确认权限。
+   * 返回 Promise<boolean>，true 表示允许执行，false 表示拒绝。
+   * 如果未提供此回调且需要确认，将默认拒绝危险操作。
+   */
+  onRequestPermission?: (
+    request: PendingPermissionRequest
+  ) => Promise<boolean>;
 };
 
 export type RunWithToolsResult = {
@@ -178,9 +197,46 @@ export async function runWithTools(
         tool_calls: calls,
       });
 
+      const permissionMode = getPermissionMode();
+
       const pairs = await Promise.all(
         calls.map(async (tc) => {
           logToolRunStart(tc);
+
+          let args: Record<string, unknown>;
+          try {
+            args = JSON.parse(tc.function.arguments || "{}") as Record<string, unknown>;
+          } catch {
+            return { tc, out: "错误：工具参数不是合法 JSON" };
+          }
+
+          // 检查是否需要权限确认
+          if (shouldRequestConfirmation(tc.function.name, permissionMode)) {
+            const request = createPermissionRequest(tc.id, tc.function.name, args);
+
+            // 如果没有提供权限回调，默认拒绝危险操作
+            if (!opts.onRequestPermission) {
+              return {
+                tc,
+                out: `错误：权限被拒绝 - 未提供权限确认机制，无法执行 ${tc.function.name}`,
+              };
+            }
+
+            // 只更新 spinnerHint，不发送 step，避免重复显示工具步骤
+            opts.onStatus?.({
+              spinnerHint: `${tc.function.name} · 等待确认: ${request.description.slice(0, 40)}...`,
+            });
+
+            const allowed = await opts.onRequestPermission(request);
+
+            if (!allowed) {
+              return {
+                tc,
+                out: `错误：用户拒绝了 ${tc.function.name} 操作`,
+              };
+            }
+          }
+
           const out = await executeToolCall(tc, opts.cwd, opts.signal);
           logToolRunEnd(tc, out);
           return { tc, out };

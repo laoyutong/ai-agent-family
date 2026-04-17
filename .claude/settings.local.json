@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(npx tsc:*)",
+      "Bash(pnpm run:*)",
+      "Bash(npm run:*)",
+      "Bash(pnpm build:*)",
+      "Bash(grep:*)"
+    ]
+  }
+}

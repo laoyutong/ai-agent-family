@@ -27,8 +27,11 @@ import { ReplInputFooter } from "./repl-input-footer.js";
 import { RESIZE_SETTLE_MS } from "./stable-stdout.js";
 import { theme } from "./theme.js";
 import { buildUserTranscriptPaddedRows } from "./user-transcript-rows.js";
+import type { PendingPermissionRequest } from "../types/index.js";
+import { PermissionPrompt, type PermissionChoice } from "./permission-prompt.js";
+import { addAllowedTool } from "../engine/permissions.js";
 
-const MemoInfoPanel = memo(InfoPanel);
+// InfoPanel 已使用 memo 包装
 
 /** 流式正文行 + 可选光标；无正文则不渲染（避免 ◆ 独占一行或空行占位） */
 const StreamSegmentLine = memo(function StreamSegmentLine(props: {
@@ -148,11 +151,6 @@ type TranscriptItem = {
   /** @deprecated 新会话用 `assistantBlocks` */
   steps?: AgentStep[];
 };
-
-/** Ink 每棵树只保留一个 staticNode；首项为常驻顶栏，其后为已结束轮次 */
-type StaticFeedItem =
-  | { kind: "intro" }
-  | (TranscriptItem & { kind: "turn" });
 
 export type ChatAppProps = {
   mode: "repl" | "single";
@@ -446,10 +444,30 @@ export function ChatApp({
   singlePrompt = "",
 }: ChatAppProps): React.JSX.Element {
   const { exit } = useApp();
-  const cwd = options.cwd ?? process.cwd();
+
+  // 使用 ref 存储初始值，确保永远不会变化
+  const initialPropsRef = useRef({
+    apiKey: options.apiKey,
+    chatUrl: options.chatUrl,
+    model: options.model,
+    cwd: options.cwd ?? process.cwd(),
+    systemPrompt: options.systemPrompt,
+  });
+
+  const stableOptions = initialPropsRef.current;
+  const cwd = stableOptions.cwd;
+
+  // InfoPanel 的 props 单独缓存
+  const infoPanelProps = useMemo(
+    () => ({
+      model: stableOptions.model,
+      cwd: stableOptions.cwd,
+    }),
+    [] // 空依赖数组，只创建一次
+  );
   const [items, setItems] = useState<TranscriptItem[]>([]);
   const messagesRef = useRef<ChatMessage[]>([
-    { role: "system", content: buildAgentSystem(options.systemPrompt, cwd) },
+    { role: "system", content: buildAgentSystem(stableOptions.systemPrompt, cwd) },
   ]);
   const [busy, setBusy] = useState(mode === "single");
   /** 当前用户轮内各次模型回复的流式正文分段（不合并；工具后的正文在步骤下方另起一段） */
@@ -464,11 +482,20 @@ export function ChatApp({
   /** 合并展示：轮次分隔 / 失败条目 + 当前正在执行的工具（单行） */
   const [stepLog, setStepLog] = useState<AgentStep[]>([]);
   const [errorBanner, setErrorBanner] = useState<string | null>(null);
+  /** 权限确认相关状态和 ref */
+  const [pendingPermission, setPendingPermission] = useState<PendingPermissionRequest | null>(null);
+  const permissionResolveRef = useRef<((allowed: boolean) => void) | null>(null);
   const abortRef = useRef<AbortController | null>(null);
   const stepLogRef = useRef<AgentStep[]>([]);
   const runningToolStepRef = useRef<AgentStep | null>(null);
   const idSeq = useRef(0);
   const startedSingle = useRef(false);
+
+  /** 使用 ref 访问最新状态，避免 useInput 闭包问题 */
+  const busyRef = useRef(busy);
+  busyRef.current = busy;
+  const pendingPermissionRef = useRef(pendingPermission);
+  pendingPermissionRef.current = pendingPermission;
 
   const nextId = (): string => {
     idSeq.current += 1;
@@ -496,9 +523,9 @@ export function ChatApp({
 
       try {
         const { assistantText, error } = await runWithTools({
-          chatUrl: options.chatUrl,
-          apiKey: options.apiKey,
-          model: options.model,
+          chatUrl: stableOptions.chatUrl,
+          apiKey: stableOptions.apiKey,
+          model: stableOptions.model,
           messages: messagesRef.current,
           cwd,
           signal: ac.signal,
@@ -507,7 +534,8 @@ export function ChatApp({
             if (step) {
               if (step.tone === "round" || step.tone === "fail") {
                 runningToolStepRef.current = null;
-                stepLogRef.current.push(step);
+                // 轮次分隔时，清空 stepLog（这些步骤已经被记录到 assistantBlocks 中）
+                stepLogRef.current = [];
               } else if (
                 step.tone === "invoke" &&
                 (step.outcome !== undefined || step.invokeComplete)
@@ -564,6 +592,12 @@ export function ChatApp({
               return next;
             });
           },
+          onRequestPermission: async (request) => {
+            return new Promise((resolve) => {
+              permissionResolveRef.current = resolve;
+              setPendingPermission(request);
+            });
+          },
         });
         const assistantBlocks = buildAssistantTurnBlocks(
           messagesRef.current,
@@ -604,13 +638,22 @@ export function ChatApp({
         setStepLog([]);
       }
     },
-    [options.apiKey, options.chatUrl, options.model, cwd],
+    [stableOptions.apiKey, stableOptions.chatUrl, stableOptions.model, cwd],
   );
 
+  // 全局 Ctrl+C 退出 - 使用 ref 检查状态避免闭包问题
   useInput(
-    (_input, key) => {
-      if (key.ctrl && _input === "c") {
-        if (busy && abortRef.current) {
+    (input: string, key: { ctrl: boolean }) => {
+      // 忽略鼠标事件序列
+      if (input.startsWith("\x1b[") || input.startsWith("\x1b[M")) {
+        return;
+      }
+
+      // 如果有确认框显示，完全忽略输入
+      if (pendingPermissionRef.current) return;
+
+      if (key.ctrl && input === "c") {
+        if (busyRef.current && abortRef.current) {
           abortRef.current.abort();
         } else {
           exit();
@@ -654,27 +697,154 @@ export function ChatApp({
     handleSubmitLineRef.current(line);
   }, []);
 
-  const staticFeed = useMemo((): StaticFeedItem[] => {
-    return [
-      { kind: "intro" },
-      ...items.map((row) => ({ kind: "turn" as const, ...row })),
-    ];
-  }, [items]);
+  // 流式内容也使用 useMemo 缓存
+  // 使用 useRef 缓存已经渲染过的工具步骤，避免重复渲染
+  const renderedToolsRef = useRef<Set<string>>(new Set());
 
-  return (
-    <Box
-      flexDirection="column"
-      paddingX={1}
-      gap={0}
-      rowGap={0}
-      columnGap={0}
-      width="100%"
-    >
-      <Static items={staticFeed}>
-        {(row) =>
-          row.kind === "intro" ? (
-            <MemoInfoPanel key="__info__" model={options.model} cwd={cwd} />
-          ) : row.role === "user" ? (
+  const streamingContent = useMemo(() => {
+    if (!busy) {
+      // busy 为 false 时清空已渲染工具记录
+      renderedToolsRef.current.clear();
+      return null;
+    }
+
+    const groups = splitStepLogIntoToolGroups(stepLog);
+    const S = streamSegments.length;
+    const G = groups.length;
+    const postFirst = postToolsFirstSegmentRef.current;
+    const lastI = S - 1;
+    const hasStepsForPhase =
+      G > 0 && groups.some((g) => hasRenderableAgentSteps(g));
+    const showPhaseRow = !phaseDuplicatesStepPanel(phaseHint, hasStepsForPhase);
+
+    type LivePart = {
+      kind: SegmentKind;
+      node: React.ReactNode;
+      key: string;
+    };
+    const pieces: LivePart[] = [];
+
+    if (S === 0) {
+      for (let j = 0; j < G; j++) {
+        const group = groups[j]!;
+        const groupKey = group.map(s => s.toolCallId || s.title).join('-');
+        pieces.push({
+          kind: "tools",
+          key: `tools-${groupKey}`,
+          node: <AssistantStepsBlock steps={group} />,
+        });
+      }
+      if (showPhaseRow) {
+        pieces.push({
+          kind: "model",
+          key: `phase-${phaseHint}`,
+          node: <BusyPhaseFooter hint={phaseHint || "处理中…"} />,
+        });
+      }
+    } else if (postFirst) {
+      const maxJ = Math.max(S, G);
+      for (let j = 0; j < maxJ; j++) {
+        if (j < G) {
+          const group = groups[j]!;
+          const groupKey = group.map(s => s.toolCallId || s.title).join('-');
+          pieces.push({
+            kind: "tools",
+            key: `tools-${groupKey}`,
+            node: <AssistantStepsBlock steps={group} />,
+          });
+        }
+        if (j < S && hasStreamText(streamSegments[j])) {
+          pieces.push({
+            kind: "model",
+            key: `stream-${j}-${streamSegments[j]?.slice(0, 20)}`,
+            node: (
+              <StreamSegmentLine
+                text={streamSegments[j] ?? ""}
+                showCursor={j === lastI}
+              />
+            ),
+          });
+        }
+      }
+    } else {
+      for (let j = 0; j < S; j++) {
+        if (hasStreamText(streamSegments[j])) {
+          pieces.push({
+            kind: "model",
+            key: `stream-${j}-${streamSegments[j]?.slice(0, 20)}`,
+            node: (
+              <StreamSegmentLine
+                text={streamSegments[j] ?? ""}
+                showCursor={j === lastI}
+              />
+            ),
+          });
+        }
+        if (j < G) {
+          const group = groups[j]!;
+          const groupKey = group.map(s => s.toolCallId || s.title).join('-');
+          pieces.push({
+            kind: "tools",
+            key: `tools-${groupKey}`,
+            node: <AssistantStepsBlock steps={group} />,
+          });
+        }
+      }
+      for (let j = S; j < G; j++) {
+        const group = groups[j]!;
+        const groupKey = group.map(s => s.toolCallId || s.title).join('-');
+        pieces.push({
+          kind: "tools",
+          key: `tools-${groupKey}`,
+          node: <AssistantStepsBlock steps={group} />,
+        });
+      }
+    }
+
+    const appendPhaseFooter =
+      S > 0 &&
+      phaseHint.trim().length > 0 &&
+      !phaseDuplicatesStepPanel(phaseHint, hasStepsForPhase);
+    const tailIndex = pieces.length;
+
+    return (
+      <Box flexDirection="column" width="100%" gap={0}>
+        {pieces.map((p, i) => (
+          <AssistantSegmentCard
+            key={p.key}
+            index={i}
+            kind={p.kind}
+            prevKind={i === 0 ? null : pieces[i - 1]!.kind}
+          >
+            {p.node}
+          </AssistantSegmentCard>
+        ))}
+        {appendPhaseFooter ? (
+          <AssistantSegmentCard
+            key={`phase-footer-${phaseHint}`}
+            index={tailIndex}
+            kind="model"
+            prevKind={tailIndex === 0 ? null : pieces[tailIndex - 1]!.kind}
+          >
+            <BusyPhaseFooter hint={phaseHint} />
+          </AssistantSegmentCard>
+        ) : null}
+      </Box>
+    );
+  }, [busy, stepLog, streamSegments, phaseHint]);
+
+  // 静态历史消息 - 使用 Static 确保一旦渲染后不再更新
+  // 包含 InfoPanel 作为第一个静态项，确保它永远不会重复渲染
+  const staticItems = useMemo(() => {
+    const headerItem = {
+      id: "__info_panel__",
+      node: <InfoPanel {...infoPanelProps} />,
+    };
+
+    const messageItems = items.map((row) => ({
+      id: row.id,
+      node:
+          row.role === "user" ? (
             <MessageCard key={row.id} role="user">
               <UserTranscriptLines text={row.text} />
             </MessageCard>
@@ -803,142 +973,71 @@ export function ChatApp({
                 </>
               )}
             </Box>
-          )
-        }
+          ),
+      }));
+
+    return [headerItem, ...messageItems];
+  }, [items, infoPanelProps]);
+
+  return (
+    <>
+      {/* 静态区域：InfoPanel + 历史消息 - 一旦渲染就不再更新 */}
+      <Static items={staticItems}>
+        {(item) => (
+          <Box key={item.id} flexDirection="column" width="100%">
+            {item.node}
+          </Box>
+        )}
       </Static>
 
-      {busy
-        ? (() => {
-            const groups = splitStepLogIntoToolGroups(stepLog);
-            const S = streamSegments.length;
-            const G = groups.length;
-            const postFirst = postToolsFirstSegmentRef.current;
-            const lastI = S - 1;
-            const hasStepsForPhase =
-              G > 0 && groups.some((g) => hasRenderableAgentSteps(g));
-            const showPhaseRow =
-              !phaseDuplicatesStepPanel(phaseHint, hasStepsForPhase);
+      {/* 动态区域：流式内容、错误、权限确认、输入框 */}
+      <Box
+        flexDirection="column"
+        paddingX={1}
+        gap={0}
+        rowGap={0}
+        columnGap={0}
+        width="100%"
+      >
+        {streamingContent}
 
-            type LivePart = { kind: SegmentKind; node: React.ReactNode };
-            const pieces: LivePart[] = [];
+        {errorBanner ? (
+          <Box
+            flexDirection="column"
+            marginBottom={0}
+            paddingX={1}
+            borderStyle="round"
+            borderColor={theme.error}
+          >
+            <Text bold color={theme.error}>
+              出错了
+            </Text>
+            <Text color={theme.error} wrap="wrap">
+              {tightenTranscriptText(errorBanner)}
+            </Text>
+          </Box>
+        ) : null}
 
-            if (S === 0) {
-              for (let j = 0; j < G; j++) {
-                pieces.push({
-                  kind: "tools",
-                  node: <AssistantStepsBlock steps={groups[j]!} />,
-                });
+        {pendingPermission ? (
+          <PermissionPrompt
+            request={pendingPermission}
+            onResolve={(choice: PermissionChoice) => {
+              const allowed = choice !== "deny";
+              if (choice === "allow" && pendingPermission) {
+                addAllowedTool(pendingPermission.toolName);
               }
-              if (showPhaseRow) {
-                pieces.push({
-                  kind: "model",
-                  node: <BusyPhaseFooter hint={phaseHint || "处理中…"} />,
-                });
-              }
-            } else if (postFirst) {
-              const maxJ = Math.max(S, G);
-              for (let j = 0; j < maxJ; j++) {
-                if (j < G) {
-                  pieces.push({
-                    kind: "tools",
-                    node: <AssistantStepsBlock steps={groups[j]!} />,
-                  });
-                }
-                if (j < S && hasStreamText(streamSegments[j])) {
-                  pieces.push({
-                    kind: "model",
-                    node: (
-                      <StreamSegmentLine
-                        text={streamSegments[j] ?? ""}
-                        showCursor={j === lastI}
-                      />
-                    ),
-                  });
-                }
-              }
-            } else {
-              for (let j = 0; j < S; j++) {
-                if (hasStreamText(streamSegments[j])) {
-                  pieces.push({
-                    kind: "model",
-                    node: (
-                      <StreamSegmentLine
-                        text={streamSegments[j] ?? ""}
-                        showCursor={j === lastI}
-                      />
-                    ),
-                  });
-                }
-                if (j < G) {
-                  pieces.push({
-                    kind: "tools",
-                    node: <AssistantStepsBlock steps={groups[j]!} />,
-                  });
-                }
-              }
-              for (let j = S; j < G; j++) {
-                pieces.push({
-                  kind: "tools",
-                  node: <AssistantStepsBlock steps={groups[j]!} />,
-                });
-              }
-            }
+              permissionResolveRef.current?.(allowed);
+              permissionResolveRef.current = null;
+              setPendingPermission(null);
+            }}
+          />
+        ) : null}
 
-            const appendPhaseFooter =
-              S > 0 &&
-              phaseHint.trim().length > 0 &&
-              !phaseDuplicatesStepPanel(phaseHint, hasStepsForPhase);
-            const tailIndex = pieces.length;
-
-            return (
-              <Box flexDirection="column" width="100%" gap={0}>
-                {pieces.map((p, i) => (
-                  <AssistantSegmentCard
-                    key={`live-seg-${i}`}
-                    index={i}
-                    kind={p.kind}
-                    prevKind={i === 0 ? null : pieces[i - 1]!.kind}
-                  >
-                    {p.node}
-                  </AssistantSegmentCard>
-                ))}
-                {appendPhaseFooter ? (
-                  <AssistantSegmentCard
-                    key="live-phase-footer"
-                    index={tailIndex}
-                    kind="model"
-                    prevKind={
-                      tailIndex === 0 ? null : pieces[tailIndex - 1]!.kind
-                    }
-                  >
-                    <BusyPhaseFooter hint={phaseHint} />
-                  </AssistantSegmentCard>
-                ) : null}
-              </Box>
-            );
-          })()
-        : null}
-
-      {errorBanner ? (
-        <Box
-          flexDirection="column"
-          marginBottom={0}
-          paddingX={1}
-          borderStyle="round"
-          borderColor={theme.error}
-        >
-          <Text bold color={theme.error}>
-            出错了
-          </Text>
-          <Text color={theme.error} wrap="wrap">
-            {tightenTranscriptText(errorBanner)}
-          </Text>
-        </Box>
-      ) : null}
-
-      {mode === "repl" && !busy ? (
-        <ReplInputFooter onSubmitLine={stableOnSubmitLine} />
-      ) : null}
-    </Box>
+        {/* 输入框：确认框显示时完全卸载 */}
+        {mode === "repl" && !busy && !pendingPermission ? (
+          <ReplInputFooter onSubmitLine={stableOnSubmitLine} />
+        ) : null}
+      </Box>
+    </>
   );
 }

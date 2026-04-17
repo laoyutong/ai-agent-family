@@ -1,4 +1,4 @@
-import React from "react";
+import React, { memo } from "react";
 import { Box, Text } from "ink";
 import { MascotCatLines } from "./mascot-cat.js";
 import { shortenPath, theme } from "./theme.js";
@@ -11,7 +11,10 @@ export type InfoPanelProps = {
 /**
  * 启动信息总览：小猫、CLI、模型、目录 —— 同一圆角框内，尽量紧凑。
  */
-export function InfoPanel({ model, cwd }: InfoPanelProps): React.JSX.Element {
+export const InfoPanel = memo(function InfoPanel({
+  model,
+  cwd,
+}: InfoPanelProps): React.JSX.Element {
   const cwdDisplay = shortenPath(cwd);
 
   return (
@@ -50,4 +53,4 @@ export function InfoPanel({ model, cwd }: InfoPanelProps): React.JSX.Element {
       </Box>
     </Box>
   );
-}
+});

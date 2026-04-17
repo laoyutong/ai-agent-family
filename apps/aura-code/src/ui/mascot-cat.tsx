@@ -1,4 +1,4 @@
-import React from "react";
+import React, { memo } from "react";
 import { Box, Text } from "ink";
 import { theme } from "./theme.js";
 
@@ -9,7 +9,7 @@ export const MASCOT_CAT_LINES = [
   "  ～ 喵 ～ ",
 ] as const;
 
-export function MascotCatLines(): React.JSX.Element {
+export const MascotCatLines = memo(function MascotCatLines(): React.JSX.Element {
   return (
     <Box flexDirection="column" alignItems="flex-start" marginBottom={0}>
       {MASCOT_CAT_LINES.map((line, i) => (
@@ -19,4 +19,4 @@ export function MascotCatLines(): React.JSX.Element {
       ))}
     </Box>
   );
-}
+});
