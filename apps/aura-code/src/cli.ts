@@ -21,7 +21,7 @@ export function parseCli(argv: string[]): CliOptions {
     .option(
       "-m, --model <id>",
       "DeepSeek 模型 id",
-      process.env.DEEPSEEK_MODEL ?? "deepseek-chat",
+      process.env.DEEPSEEK_MODEL ?? "deepseek-v4-flash",
     )
     .option("--cwd <path>", "工作目录", process.cwd())
     .option(

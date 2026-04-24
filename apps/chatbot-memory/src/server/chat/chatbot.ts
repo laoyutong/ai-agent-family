@@ -105,7 +105,7 @@ export function createMemoryChatbot(options?: MemoryChatbotOptions) {
   const userFactsStore = options?.userFactsStore;
   const apiKey = options?.apiKey ?? process.env.DEEPSEEK_API_KEY;
   const baseURL = options?.baseURL ?? process.env.DEEPSEEK_BASE_URL ?? "https://api.deepseek.com";
-  const model = options?.model ?? process.env.DEEPSEEK_MODEL ?? "deepseek-chat";
+  const model = options?.model ?? process.env.DEEPSEEK_MODEL ?? "deepseek-v4-flash";
   const temperature = options?.temperature ?? 0.7;
   const systemPrompt =
     options?.systemPrompt ??

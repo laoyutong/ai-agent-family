@@ -16,7 +16,7 @@ export function buildAppConfig(cli: CliOptions): AppConfig {
   const model =
     cli.model.trim() ||
     env.DEEPSEEK_MODEL?.trim() ||
-    "deepseek-chat";
+    "deepseek-v4-flash";
   return {
     apiKey,
     baseUrl,
